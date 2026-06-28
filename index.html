@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Yoto Feed Club</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="window-bar">Yoto Feed Club</div>
+
+    <div class="app-shell">
+      <aside class="side-panel" aria-label="App menu">
+        <div class="side-hero">
+          <button class="icon-button back-button" type="button" aria-label="Back">
+            <span aria-hidden="true">&larr;</span>
+          </button>
+        </div>
+
+        <div class="profile-block">
+          <div class="avatar-ring" aria-hidden="true">
+            <div class="avatar-card">
+              <span class="avatar-dot dot-one"></span>
+              <span class="avatar-dot dot-two"></span>
+              <span class="avatar-line line-one"></span>
+              <span class="avatar-line line-two"></span>
+              <span class="avatar-smile"></span>
+            </div>
+          </div>
+          <p class="profile-name">Mio</p>
+        </div>
+
+        <nav class="nav-list" aria-label="Sections">
+          <a class="nav-item is-active" href="#">My Cards</a>
+          <a class="nav-item" href="#">Feeds</a>
+          <a class="nav-item" href="#">Settings</a>
+          <a class="nav-item" href="#">Help</a>
+        </nav>
+      </aside>
+
+      <main class="dashboard">
+        <header class="dashboard-header">
+          <div>
+            <p class="eyebrow">Level 1</p>
+            <h1>Mio's Yoto Cards</h1>
+          </div>
+          <button id="addCardButton" class="primary-action" type="button">
+            <span class="button-icon" aria-hidden="true">+</span>
+            Add card
+          </button>
+        </header>
+
+        <section class="metric-strip" aria-label="Sync overview">
+          <article class="metric-card metric-pink">
+            <div>
+              <p>Ready cards</p>
+              <strong>4</strong>
+            </div>
+            <div class="metric-picture picture-disc" aria-hidden="true"></div>
+          </article>
+
+          <article class="metric-card metric-blue">
+            <div>
+              <p>Cards syncing</p>
+              <strong>2</strong>
+            </div>
+            <div class="metric-picture picture-crown" aria-hidden="true"></div>
+          </article>
+
+          <article class="metric-card metric-teal">
+            <div>
+              <p>Next crawl</p>
+              <strong>Jun 28, 2026</strong>
+              <span>7:30 PM</span>
+            </div>
+            <div class="metric-picture picture-hourglass" aria-hidden="true"></div>
+          </article>
+        </section>
+
+        <section class="section-heading" aria-labelledby="cardsHeading">
+          <div>
+            <h2 id="cardsHeading">Cards</h2>
+            <p>4 cards ready to check.</p>
+          </div>
+          <button class="outline-action" type="button">Show all</button>
+        </section>
+
+        <section id="cardGrid" class="card-grid" aria-label="Uploaded Yoto cards"></section>
+      </main>
+    </div>
+
+    <div id="dialogBackdrop" class="dialog-backdrop" hidden>
+      <section
+        class="editor-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="dialogTitle"
+      >
+        <div class="dialog-preview">
+          <div id="dialogArt" class="dialog-cover card-picture art-cloud" aria-hidden="true">
+            <span class="cover-shape shape-one"></span>
+            <span class="cover-shape shape-two"></span>
+            <span class="cover-shape shape-three"></span>
+          </div>
+          <div class="preview-copy">
+            <p class="mini-label">Yoto card</p>
+            <h2 id="dialogTitle">Story Station</h2>
+            <p id="dialogStatus" class="status-pill status-live">Live - actively syncing</p>
+            <p id="dialogCrawl" class="next-crawl-line">Next crawl: Jun 28, 2026, 7:30 PM</p>
+          </div>
+        </div>
+
+        <form class="dialog-form">
+          <div class="dialog-topline">
+            <p class="eyebrow">Auto-feed</p>
+            <button id="closeDialog" class="icon-button close-button" type="button" aria-label="Close">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Playlist name</span>
+              <input id="playlistName" type="text" value="Story Station" />
+            </label>
+
+            <label class="field">
+              <span>RSS feed</span>
+              <input id="rssFeed" type="url" value="https://example.com/story-station.xml" />
+            </label>
+
+            <label class="field">
+              <span>Yoto card</span>
+              <select id="yotoCard">
+                <option>Blue Make My Own card</option>
+                <option>Pink Make My Own card</option>
+                <option>Yellow Make My Own card</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Next crawl</span>
+              <input id="nextCrawl" type="datetime-local" value="2026-06-28T19:30" />
+            </label>
+          </div>
+
+          <div class="control-group" aria-labelledby="frequencyLabel">
+            <p id="frequencyLabel">Check for new episodes</p>
+            <div class="segmented-control">
+              <button class="segment is-selected" type="button" data-frequency="Daily">Daily</button>
+              <button class="segment" type="button" data-frequency="Weekly">Weekly</button>
+              <button class="segment" type="button" data-frequency="Monthly">Monthly</button>
+            </div>
+          </div>
+
+          <div class="switch-row">
+            <div>
+              <p>Auto-feed</p>
+              <span id="switchStatus">On and watching</span>
+            </div>
+            <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
+              <span></span>
+            </button>
+          </div>
+
+          <div class="dialog-actions">
+            <button id="pauseCard" class="quiet-action" type="button">Pause</button>
+            <button id="saveCard" class="primary-action" type="button">Save</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
