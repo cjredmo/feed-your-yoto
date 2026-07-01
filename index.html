@@ -44,11 +44,18 @@
             <p class="eyebrow">Level 1</p>
             <h1>Mio's Yoto Cards</h1>
           </div>
-          <button id="addCardButton" class="primary-action" type="button">
-            <span class="button-icon" aria-hidden="true">+</span>
-            Add card
-          </button>
+          <div class="header-actions">
+            <button id="authButton" class="outline-action auth-button" type="button">Login</button>
+            <button id="addCardButton" class="primary-action" type="button">
+              <span class="button-icon" aria-hidden="true">+</span>
+              Add card
+            </button>
+          </div>
         </header>
+
+        <div id="authBanner" class="auth-banner" role="status" hidden>
+          Connect your Yoto account to add cards and manage podcast feeds.
+        </div>
 
         <section class="metric-strip" aria-label="Sync overview">
           <article class="metric-card metric-pink">
@@ -82,7 +89,7 @@
             <h2 id="cardsHeading">Cards</h2>
             <p>4 cards ready to check.</p>
           </div>
-          <button class="outline-action" type="button">Show all</button>
+          <button id="showAllButton" class="outline-action" type="button">Show all</button>
         </section>
 
         <section id="cardGrid" class="card-grid" aria-label="Uploaded Yoto cards"></section>
@@ -171,6 +178,47 @@
       </section>
     </div>
 
+    <div id="authBackdrop" class="dialog-backdrop auth-backdrop" hidden>
+      <section class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+        <button id="closeAuthDialog" class="icon-button close-button auth-close" type="button" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+
+        <div id="authStartState" class="auth-state">
+          <p class="eyebrow">Yoto account</p>
+          <h2 id="authTitle">Connect your Yoto account</h2>
+          <p class="auth-copy">
+            Sign in with the Yoto account that owns the MYO card you want to manage.
+          </p>
+          <div class="auth-actions">
+            <button id="connectYotoButton" class="primary-action" type="button">
+              Connect Yoto Account
+            </button>
+            <button id="notNowButton" class="quiet-action" type="button">Not now</button>
+          </div>
+        </div>
+
+        <div id="authDeviceState" class="auth-state" hidden>
+          <p class="eyebrow">Yoto account</p>
+          <h2>Finish signing in with Yoto</h2>
+          <p class="auth-copy">Open this link and enter the code below.</p>
+          <div class="auth-code-box">
+            <span>Code</span>
+            <strong id="authUserCode">----</strong>
+          </div>
+          <div class="auth-actions">
+            <button id="openYotoLogin" class="primary-action" type="button" disabled>
+              Open Yoto Login
+            </button>
+            <button id="cancelAuthButton" class="quiet-action" type="button">Cancel</button>
+          </div>
+        </div>
+
+        <p id="authMessage" class="auth-message" role="status"></p>
+      </section>
+    </div>
+
+    <script src="config.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
