@@ -86,9 +86,12 @@ let yotoCardsLoadId = 0;
 
 function getFreshSetupDraft() {
   return {
+    playlistMode: "create",
+    newPlaylistTitle: "New Story Playlist",
     yotoCardId: "",
     yotoCardTitle: "",
     yotoCardImageUrl: null,
+    overwriteAcknowledged: false,
     name: "",
     podcastLink: "",
     updateRhythm: "daily",
@@ -329,7 +332,7 @@ const getPlaylistArtMarkup = (card) => {
 };
 
 const getStoryCardPlaylistTitle = (storyCard) =>
-  storyCard?.yotoPlaylistTitle || storyCard?.yotoCardName || "Yoto Playlist";
+  storyCard?.yotoPlaylistTitle || storyCard?.yotoCardName || "Story Playlist";
 
 const getStoryCardPlaylistImageUrl = (storyCard) =>
   storyCard?.yotoPlaylistImageUrl || storyCard?.yotoCardImageUrl || null;
@@ -370,26 +373,44 @@ const getRegularYotoPlaylists = () => availableYotoCards.filter(isCompatibleYoto
 const getStreamingYotoPlaylists = () =>
   availableYotoCards.filter((card) => card?.hasStreams || card?.compatible === false);
 
+const getUsedStoryCardForPlaylist = (playlistId) =>
+  storyCards.find((storyCard) => storyCard.yotoPlaylistId === playlistId);
+
+const isYotoPlaylistAlreadyUsed = (playlistId) => Boolean(getUsedStoryCardForPlaylist(playlistId));
+
+const getUnusedRegularYotoPlaylists = () =>
+  getRegularYotoPlaylists().filter((card) => !isYotoPlaylistAlreadyUsed(card.id));
+
 const chooseDefaultSetupPlaylist = () => {
-  const selectedStillAvailable = getRegularYotoPlaylists().some(
+  if (setupDraft.playlistMode !== "existing") return;
+
+  const selectedStillAvailable = getUnusedRegularYotoPlaylists().some(
     (card) => card.id === setupDraft.yotoCardId
   );
 
   if (!selectedStillAvailable) {
-    setSetupSelectedCard(getRegularYotoPlaylists()[0] || null);
+    setSetupSelectedCard(getUnusedRegularYotoPlaylists()[0] || null);
   }
 };
 
-const renderPlaylistTile = (card, { selectable }) => {
+const renderPlaylistTile = (card, { selectable, reason = "", usedStoryCard = null }) => {
   const title = getYotoCardTitle(card);
 
   if (!selectable) {
+    const label = reason === "used" ? "Already used" : "Streaming playlist";
+    const helper =
+      reason === "used"
+        ? "This playlist is already connected to another Story Card."
+        : "Streaming playlists are grouped separately.";
+    const usedBy = usedStoryCard ? ` Used by "${escapeHtml(usedStoryCard.name)}".` : "";
+
     return `
-      <article class="setup-option playlist-option is-disabled" aria-disabled="true">
+      <article class="setup-option playlist-option is-disabled ${reason === "used" ? "is-used" : ""}" aria-disabled="true">
         ${getPlaylistArtMarkup(card)}
         <span class="playlist-copy">
           <strong>${escapeHtml(title)}</strong>
-          <span>Streaming playlist</span>
+          <span class="playlist-badge">${escapeHtml(label)}</span>
+          <small>${escapeHtml(helper)}${usedBy}</small>
         </span>
       </article>
     `;
@@ -400,7 +421,7 @@ const renderPlaylistTile = (card, { selectable }) => {
       ${getPlaylistArtMarkup(card)}
       <span class="playlist-copy">
         <strong>${escapeHtml(title)}</strong>
-        <span>Yoto playlist</span>
+        <span>Story Playlist</span>
       </span>
     </button>
   `;
@@ -413,6 +434,31 @@ const renderPlaylistRefreshButton = () => `
     </button>
   </div>
 `;
+
+const renderPlaylistModeTabs = () => `
+  <div class="setup-mode-tabs" role="tablist" aria-label="Story Playlist setup options">
+    <button class="setup-mode-tab ${setupDraft.playlistMode === "create" ? "is-selected" : ""}" type="button" data-playlist-mode="create">
+      Make New Story Playlist
+      <span>Recommended</span>
+    </button>
+    <button class="setup-mode-tab ${setupDraft.playlistMode === "existing" ? "is-selected" : ""}" type="button" data-playlist-mode="existing">
+      Use Existing Story Playlist
+      <span>Advanced</span>
+    </button>
+  </div>
+`;
+
+const canContinueFromPlaylistStep = () => {
+  if (setupDraft.playlistMode === "create") {
+    return Boolean(setupDraft.newPlaylistTitle.trim());
+  }
+
+  return (
+    yotoCardsLoadState.status === "loaded" &&
+    Boolean(setupDraft.yotoCardId) &&
+    setupDraft.overwriteAcknowledged
+  );
+};
 
 const getRhythmLabel = (value) =>
   updateRhythmOptions.find((option) => option.value === value)?.label || "Every day";
@@ -477,7 +523,7 @@ function renderCards() {
     cardGrid.innerHTML = `
       <div class="empty-state">
         <h3>No story cards yet.</h3>
-        <p>Choose a Yoto playlist and add a podcast link to get started.</p>
+        <p>Choose a Story Playlist and add a podcast link to get started.</p>
         <button class="primary-action" type="button" data-empty-add>
           <span class="button-icon" aria-hidden="true">+</span>
           Add Story Card
@@ -498,7 +544,7 @@ function renderCards() {
           <span class="status-pill status-${escapeAttribute(storyCard.statusType)}">${escapeHtml(storyCard.status)}</span>
           <div class="card-details">
             <div>
-              <span>Yoto Playlist</span>
+              <span>Story Playlist</span>
               <strong>${escapeHtml(getStoryCardPlaylistTitle(storyCard))}</strong>
             </div>
             <div>
@@ -677,7 +723,7 @@ const saveActiveCard = async () => {
 };
 
 const setSetupSelectedCard = (card) => {
-  if (!isCompatibleYotoPlaylist(card)) {
+  if (!isCompatibleYotoPlaylist(card) || isYotoPlaylistAlreadyUsed(card?.id)) {
     setupDraft.yotoCardId = "";
     setupDraft.yotoCardTitle = "";
     setupDraft.yotoCardImageUrl = null;
@@ -711,7 +757,7 @@ const loadYotoCardsForSetup = async ({ force = false, showLoading = true } = {})
 
   yotoCardsLoadState = {
     status: "loading",
-    message: "Loading your Yoto playlists...",
+    message: "Loading your Story Playlists...",
   };
   if (showLoading && !setupBackdrop.hidden) renderSetupStep();
 
@@ -734,7 +780,7 @@ const loadYotoCardsForSetup = async ({ force = false, showLoading = true } = {})
       message:
         error.status === 401
           ? "Connect Yoto before choosing a card."
-          : "Could not load your Yoto playlists. Try reconnecting Yoto.",
+          : "Could not load your Story Playlists. Try reconnecting Yoto.",
     };
 
     if (error.status === 401) {
@@ -749,9 +795,7 @@ const renderSetupStep = () => {
   setupError.textContent = "";
   setupBackButton.hidden = setupStep === 0;
   setupNextButton.hidden = setupStep === 2;
-  setupNextButton.disabled =
-    setupStep === 0 &&
-    (yotoCardsLoadState.status !== "loaded" || !setupDraft.yotoCardId);
+  setupNextButton.disabled = setupStep === 0 && !canContinueFromPlaylistStep();
   saveStoryCardButton.hidden = setupStep !== 2 || !isSetupDraftComplete();
 
   document.querySelectorAll("[data-step-indicator]").forEach((indicator) => {
@@ -760,9 +804,25 @@ const renderSetupStep = () => {
 
   if (setupStep === 0) {
     setupTitle.textContent = "Pick a Story Playlist";
+
+    if (setupDraft.playlistMode === "create") {
+      setupStepContent.innerHTML = `
+        ${renderPlaylistModeTabs()}
+        <div class="setup-field-stack">
+          <label class="field">
+            <span>New Story Playlist Name</span>
+            <input id="setupNewPlaylistTitle" type="text" value="${escapeAttribute(setupDraft.newPlaylistTitle)}" autocomplete="off" />
+            <small>Recommended. Feed Your Yoto will create a fresh Story Playlist for this podcast so nothing you already have gets overwritten. After setup, open the Yoto app to link this playlist to a physical Make Your Own card.</small>
+          </label>
+        </div>
+      `;
+      return;
+    }
+
     if (yotoCardsLoadState.status === "idle" || yotoCardsLoadState.status === "loading") {
       setupStepContent.innerHTML = `
-        <p class="setup-helper">Loading your Yoto playlists...</p>
+        ${renderPlaylistModeTabs()}
+        <p class="setup-helper">Loading your Story Playlists...</p>
         ${renderPlaylistRefreshButton()}
       `;
       return;
@@ -770,7 +830,8 @@ const renderSetupStep = () => {
 
     if (yotoCardsLoadState.status === "unauthenticated") {
       setupStepContent.innerHTML = `
-        <p class="setup-helper">Connect Yoto before choosing a card.</p>
+        ${renderPlaylistModeTabs()}
+        <p class="setup-helper">Connect Yoto before choosing a playlist.</p>
         ${renderPlaylistRefreshButton()}
       `;
       return;
@@ -778,6 +839,7 @@ const renderSetupStep = () => {
 
     if (yotoCardsLoadState.status === "error") {
       setupStepContent.innerHTML = `
+        ${renderPlaylistModeTabs()}
         <p class="setup-helper">${escapeHtml(yotoCardsLoadState.message)}</p>
         ${renderPlaylistRefreshButton()}
       `;
@@ -789,6 +851,7 @@ const renderSetupStep = () => {
 
     if (!regularPlaylists.length && !streamingPlaylists.length) {
       setupStepContent.innerHTML = `
+        ${renderPlaylistModeTabs()}
         <p class="setup-helper">No compatible playlists found.</p>
         ${renderPlaylistRefreshButton()}
         <p class="setup-note">Streaming playlists are grouped separately because this app manages uploaded Yoto audio.</p>
@@ -797,15 +860,33 @@ const renderSetupStep = () => {
     }
 
     setupStepContent.innerHTML = `
-      <p class="setup-helper">Choose the Yoto playlist this app should keep updated. You can link that playlist to a physical Make Your Own card in the Yoto app.</p>
+      ${renderPlaylistModeTabs()}
+      <p class="setup-helper">Use this only if you want Feed Your Yoto to manage a playlist that already exists.</p>
+      <div class="setup-warning" role="note">
+        <strong>Grown-up note</strong>
+        <span>Feed Your Yoto will manage this playlist. When syncing starts, this may replace the playlist's chapters and tracks with podcast episodes.</span>
+      </div>
+      <label class="setup-checkbox">
+        <input id="setupOverwriteAcknowledged" type="checkbox" ${setupDraft.overwriteAcknowledged ? "checked" : ""} />
+        <span>I understand this app will manage the selected Story Playlist.</span>
+      </label>
       ${renderPlaylistRefreshButton()}
       ${
         regularPlaylists.length
           ? `
             <section class="playlist-group" aria-labelledby="regularPlaylistsHeading">
-              <h3 id="regularPlaylistsHeading" class="playlist-group-title">Regular Yoto Playlists</h3>
+              <h3 id="regularPlaylistsHeading" class="playlist-group-title">Story Playlists</h3>
               <div class="setup-option-grid">
-                ${regularPlaylists.map((card) => renderPlaylistTile(card, { selectable: true })).join("")}
+                ${regularPlaylists
+                  .map((card) => {
+                    const usedStoryCard = getUsedStoryCardForPlaylist(card.id);
+                    return renderPlaylistTile(card, {
+                      selectable: !usedStoryCard,
+                      reason: usedStoryCard ? "used" : "",
+                      usedStoryCard,
+                    });
+                  })
+                  .join("")}
               </div>
             </section>
           `
@@ -819,7 +900,7 @@ const renderSetupStep = () => {
             <section class="playlist-group" aria-labelledby="streamingPlaylistsHeading">
               <h3 id="streamingPlaylistsHeading" class="playlist-group-title">Streaming Playlists</h3>
               <div class="setup-option-grid">
-                ${streamingPlaylists.map((card) => renderPlaylistTile(card, { selectable: false })).join("")}
+                ${streamingPlaylists.map((card) => renderPlaylistTile(card, { selectable: false, reason: "streaming" })).join("")}
               </div>
             </section>
           `
@@ -914,8 +995,18 @@ const validatePodcastLink = (value) => {
 };
 
 const getSetupDraftError = () => {
-  if (!setupDraft.yotoCardId) {
-    return "Choose a Story Playlist first.";
+  if (setupDraft.playlistMode === "create") {
+    if (!setupDraft.newPlaylistTitle.trim()) {
+      return "Name the new Story Playlist first.";
+    }
+  } else {
+    if (!setupDraft.yotoCardId) {
+      return "Choose a Story Playlist first.";
+    }
+
+    if (!setupDraft.overwriteAcknowledged) {
+      return "A grown-up needs to check the Story Playlist warning first.";
+    }
   }
 
   if (!setupDraft.name.trim()) {
@@ -939,8 +1030,18 @@ const getSetupDraftError = () => {
 const isSetupDraftComplete = () => getSetupDraftError() === "";
 
 const validateSetupStep = () => {
-  if (setupStep === 0 && !setupDraft.yotoCardId) {
-    return "Choose a Story Playlist first.";
+  if (setupStep === 0) {
+    if (setupDraft.playlistMode === "create") {
+      return setupDraft.newPlaylistTitle.trim() ? "" : "Name the new Story Playlist first.";
+    }
+
+    if (!setupDraft.yotoCardId) {
+      return "Choose a Story Playlist first.";
+    }
+
+    if (!setupDraft.overwriteAcknowledged) {
+      return "A grown-up needs to check the Story Playlist warning first.";
+    }
   }
 
   if (setupStep === 1) {
@@ -1004,11 +1105,23 @@ const saveSetupStoryCard = async () => {
 
   try {
     await jsonRequest("/api/story-cards", "POST", {
+      playlistMode: setupDraft.playlistMode,
+      newPlaylistTitle: setupDraft.newPlaylistTitle.trim(),
+      overwriteAcknowledged: setupDraft.overwriteAcknowledged,
       name: setupDraft.name.trim(),
       podcastLink: setupDraft.podcastLink.trim(),
-      yotoPlaylistId: selectedYotoCard?.id || setupDraft.yotoCardId,
-      yotoPlaylistTitle: setupDraft.yotoCardTitle || getYotoCardTitle(selectedYotoCard),
-      yotoPlaylistImageUrl: setupDraft.yotoCardImageUrl || selectedYotoCard?.imageUrl || null,
+      yotoPlaylistId:
+        setupDraft.playlistMode === "existing"
+          ? selectedYotoCard?.id || setupDraft.yotoCardId
+          : "",
+      yotoPlaylistTitle:
+        setupDraft.playlistMode === "existing"
+          ? setupDraft.yotoCardTitle || getYotoCardTitle(selectedYotoCard)
+          : setupDraft.newPlaylistTitle.trim(),
+      yotoPlaylistImageUrl:
+        setupDraft.playlistMode === "existing"
+          ? setupDraft.yotoCardImageUrl || selectedYotoCard?.imageUrl || null
+          : null,
       updateRhythm: setupDraft.updateRhythm,
       lateCheckRhythm: setupDraft.updateRhythm === "manual" ? "" : setupDraft.lateCheckRhythm,
       status: "Updating",
@@ -1200,6 +1313,18 @@ cancelDeleteCard.addEventListener("click", hideDeleteConfirmation);
 confirmDeleteCard.addEventListener("click", deleteActiveCard);
 
 setupStepContent.addEventListener("click", (event) => {
+  const playlistModeOption = event.target.closest("[data-playlist-mode]");
+  if (playlistModeOption) {
+    setupDraft.playlistMode = playlistModeOption.dataset.playlistMode;
+    setupDraft.yotoCardId = "";
+    setupDraft.yotoCardTitle = "";
+    setupDraft.yotoCardImageUrl = null;
+    setupDraft.overwriteAcknowledged = false;
+    chooseDefaultSetupPlaylist();
+    renderSetupStep();
+    return;
+  }
+
   const refreshPlaylistsButton = event.target.closest("[data-refresh-yoto-playlists]");
   if (refreshPlaylistsButton) {
     loadYotoCardsForSetup({ force: true });
@@ -1231,12 +1356,24 @@ setupStepContent.addEventListener("click", (event) => {
 });
 
 setupStepContent.addEventListener("input", (event) => {
+  if (event.target.id === "setupNewPlaylistTitle") {
+    setupDraft.newPlaylistTitle = event.target.value;
+    setupNextButton.disabled = !canContinueFromPlaylistStep();
+  }
+
   if (event.target.id === "setupStoryCardName") {
     setupDraft.name = event.target.value;
   }
 
   if (event.target.id === "setupPodcastLink") {
     setupDraft.podcastLink = event.target.value;
+  }
+});
+
+setupStepContent.addEventListener("change", (event) => {
+  if (event.target.id === "setupOverwriteAcknowledged") {
+    setupDraft.overwriteAcknowledged = event.target.checked;
+    setupNextButton.disabled = !canContinueFromPlaylistStep();
   }
 });
 

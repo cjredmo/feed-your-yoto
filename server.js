@@ -145,7 +145,14 @@ const createStoryCardId = (name, existingCards) => {
   return candidate;
 };
 
-const validateStoryCardInput = (body) => {
+const createExposedError = (message, status = 400) => {
+  const error = new Error(message);
+  error.status = status;
+  error.expose = true;
+  return error;
+};
+
+const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
   const errors = [];
   const updateRhythm = String(body.updateRhythm || "").trim();
   const lateCheckRhythm = String(body.lateCheckRhythm || "").trim();
@@ -155,17 +162,16 @@ const validateStoryCardInput = (body) => {
   if (body.podcastLink && !isHttpUrl(body.podcastLink)) {
     errors.push("Podcast Link should start with http or https.");
   }
-  if (!String(body.yotoPlaylistId || "").trim()) errors.push("Choose a Yoto Playlist first.");
+  if (requirePlaylist && !String(body.yotoPlaylistId || "").trim()) {
+    errors.push("Choose a Story Playlist first.");
+  }
   if (!updateRhythm) errors.push("Choose when this Story Card should check for episodes.");
   if (updateRhythm !== "manual" && !lateCheckRhythm) {
     errors.push("Choose what to do if the episode is late.");
   }
 
   if (errors.length) {
-    const error = new Error(errors[0]);
-    error.status = 400;
-    error.expose = true;
-    throw error;
+    throw createExposedError(errors[0]);
   }
 };
 
@@ -178,7 +184,7 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     name: String(body.name || "").trim(),
     podcastLink: String(body.podcastLink || "").trim(),
     yotoPlaylistId: String(body.yotoPlaylistId || "").trim(),
-    yotoPlaylistTitle: String(body.yotoPlaylistTitle || "Yoto Playlist").trim(),
+    yotoPlaylistTitle: String(body.yotoPlaylistTitle || "Story Playlist").trim(),
     yotoPlaylistImageUrl: isHttpUrl(body.yotoPlaylistImageUrl)
       ? body.yotoPlaylistImageUrl
       : null,
@@ -192,12 +198,47 @@ const normalizeStoryCard = (body, existingCard = {}) => {
   };
 };
 
-const createStoryCard = async (body) => {
-  validateStoryCardInput(body);
+const isPlaylistUsedByStoryCard = (storyCards, playlistId, ignoreStoryCardId = "") =>
+  storyCards.some(
+    (storyCard) =>
+      storyCard.id !== ignoreStoryCardId && storyCard.yotoPlaylistId === playlistId
+  );
 
+const createStoryCard = async (body) => {
   const storyCards = await readStoryCards();
-  const storyCard = normalizeStoryCard(body, {
-    id: createStoryCardId(body.name, storyCards),
+  const playlistMode = body.playlistMode === "create" ? "create" : "existing";
+  let storyCardBody = { ...body };
+
+  if (playlistMode === "create") {
+    const newPlaylistTitle = String(body.newPlaylistTitle || "").trim();
+    if (!newPlaylistTitle) {
+      throw createExposedError("Name the new Story Playlist first.");
+    }
+
+    validateStoryCardInput(storyCardBody, { requirePlaylist: false });
+    const createdPlaylist = await createYotoPlaylist(newPlaylistTitle);
+    storyCardBody = {
+      ...storyCardBody,
+      yotoPlaylistId: createdPlaylist.id,
+      yotoPlaylistTitle: createdPlaylist.title,
+      yotoPlaylistImageUrl: null,
+    };
+  } else {
+    validateStoryCardInput(storyCardBody);
+
+    if (body.overwriteAcknowledged !== true) {
+      throw createExposedError("A grown-up needs to check the Story Playlist warning first.");
+    }
+  }
+
+  validateStoryCardInput(storyCardBody);
+
+  if (isPlaylistUsedByStoryCard(storyCards, storyCardBody.yotoPlaylistId)) {
+    throw createExposedError("This Story Playlist is already connected to another Story Card.");
+  }
+
+  const storyCard = normalizeStoryCard(storyCardBody, {
+    id: createStoryCardId(storyCardBody.name, storyCards),
   });
   storyCards.push(storyCard);
   await writeStoryCards(storyCards);
@@ -406,6 +447,89 @@ const getYotoJsonWithRefresh = async (pathName, tokens) => {
   }
 };
 
+const postYotoJson = async (pathName, tokens, body) => {
+  if (typeof fetch !== "function") {
+    throw new Error("This server needs Node 18 or newer for built-in fetch.");
+  }
+
+  const response = await fetch(`${YOTO_API_BASE_URL}${pathName}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${tokens.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const error = new Error("Yoto request failed.");
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+
+  return data;
+};
+
+const postYotoJsonWithRefresh = async (pathName, tokens, body) => {
+  try {
+    return {
+      data: await postYotoJson(pathName, tokens, body),
+      tokens,
+    };
+  } catch (error) {
+    if (error.status !== 401) throw error;
+
+    const refreshed = await refreshTokens(tokens);
+    if (!hasCurrentAccessToken(refreshed)) throw error;
+
+    return {
+      data: await postYotoJson(pathName, refreshed, body),
+      tokens: refreshed,
+    };
+  }
+};
+
+const getCreatedYotoPlaylistId = (data) =>
+  data?.card?.cardId || data?.card?.card_id || data?.card?._id || data?.card?.id || data?.cardId || data?.id || "";
+
+const createYotoPlaylist = async (title) => {
+  let tokens = await getAuthenticatedTokens();
+  if (!tokens) {
+    throw createExposedError("Connect Yoto before creating a Story Playlist.", 401);
+  }
+
+  const playlistTitle = String(title || "").trim();
+  const createResponse = await postYotoJsonWithRefresh("/content", tokens, {
+    title: playlistTitle,
+    metadata: {
+      title: playlistTitle,
+      description: "Managed by Feed Your Yoto",
+    },
+    content: {
+      chapters: [],
+      config: {
+        resumeTimeout: 2592000,
+      },
+      playbackType: "linear",
+    },
+  });
+  const id = getCreatedYotoPlaylistId(createResponse.data);
+
+  if (!id) {
+    throw createExposedError("Yoto did not return a new Story Playlist id.", 502);
+  }
+
+  return {
+    id,
+    title: playlistTitle,
+    imageUrl: null,
+  };
+};
+
 const asArray = (value) => {
   if (Array.isArray(value)) return value;
   return value ? [value] : [];
@@ -434,7 +558,7 @@ const readCardTitle = (card) =>
   "";
 
 const getCardTitle = (card, fallbackCard = null) =>
-  readCardTitle(card) || readCardTitle(fallbackCard) || "Untitled Yoto card";
+  readCardTitle(card) || readCardTitle(fallbackCard) || "Untitled Story Playlist";
 
 const isBrowserImageUrl = (value) => {
   const url = String(value || "");
@@ -537,7 +661,7 @@ const getSafeYotoCards = async () => {
       tokens = detailResponse.tokens;
       cardDetails = detailResponse.data;
     } catch (error) {
-      console.warn(`Could not inspect Yoto playlist ${id}.`, error.message);
+      console.warn(`Could not inspect Story Playlist ${id}.`, error.message);
     }
 
     const detailCard = cardDetails?.card || cardDetails;
@@ -639,7 +763,8 @@ const resetAuth = async () => {
 
 const handleApi = async (request, response, pathname) => {
   try {
-    const storyCardRoute = pathname.match(/^\/api\/story-cards\/([^/]+)$/);
+    const storyCardRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/?$/);
+    const isStoryCardsRoute = pathname === "/api/story-cards" || pathname === "/api/story-cards/";
 
     if (request.method === "GET" && pathname === "/api/auth/status") {
       sendJson(response, 200, await getAuthStatus());
@@ -666,12 +791,12 @@ const handleApi = async (request, response, pathname) => {
       return;
     }
 
-    if (request.method === "GET" && pathname === "/api/story-cards") {
+    if (request.method === "GET" && isStoryCardsRoute) {
       sendJson(response, 200, await readStoryCards());
       return;
     }
 
-    if (request.method === "POST" && pathname === "/api/story-cards") {
+    if (request.method === "POST" && isStoryCardsRoute) {
       sendJson(response, 201, await createStoryCard(await readRequestJson(request)));
       return;
     }
