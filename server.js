@@ -18,6 +18,9 @@ const STATIC_FILES = new Set([
   "config.js",
   "assets/feed-your-yoto-mascot.png",
 ]);
+const PODCAST_FEED_TIMEOUT_MS = 10_000;
+const PODCAST_FEED_MAX_REDIRECTS = 5;
+const PODCAST_FEED_MAX_BYTES = 2_000_000;
 
 let resolvedDataDir = null;
 
@@ -125,6 +128,219 @@ const isHttpUrl = (value) => {
   }
 };
 
+const validatePodcastLink = (podcastLink) => {
+  const link = String(podcastLink || "").trim();
+
+  if (!link) {
+    throw createExposedError("Podcast Link is required.");
+  }
+
+  if (!isHttpUrl(link)) {
+    throw createExposedError("Podcast Link should start with http or https.");
+  }
+
+  return link;
+};
+
+const decodeXmlEntities = (value) =>
+  String(value || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/<[^>]+>/g, "")
+    .trim();
+
+const getXmlTagText = (xml, tagName, { allowPrefix = false } = {}) => {
+  const tagPattern = allowPrefix ? `(?:[\\w-]+:)?${tagName}` : tagName;
+  const match = String(xml || "").match(
+    new RegExp(`<${tagPattern}\\b[^>]*>([\\s\\S]*?)<\\/${tagPattern}>`, "i")
+  );
+  return match ? decodeXmlEntities(match[1]) : "";
+};
+
+const getXmlTagAttribute = (xml, tagName, attributeName, { allowPrefix = false } = {}) => {
+  const tagPattern = allowPrefix ? `(?:[\\w-]+:)?${tagName}` : tagName;
+  const tagMatch = String(xml || "").match(new RegExp(`<${tagPattern}\\b([^>]*)>`, "i"));
+  if (!tagMatch) return "";
+
+  const attributeMatch = tagMatch[1].match(
+    new RegExp(`${attributeName}\\s*=\\s*(["'])(.*?)\\1`, "i")
+  );
+  return attributeMatch ? decodeXmlEntities(attributeMatch[2]) : "";
+};
+
+const extractXmlBlocks = (xml, tagName) => {
+  const blocks = [];
+  const pattern = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi");
+  let match = pattern.exec(String(xml || ""));
+
+  while (match) {
+    blocks.push(match[1]);
+    match = pattern.exec(String(xml || ""));
+  }
+
+  return blocks;
+};
+
+const normalizeIsoDate = (dateValue) => {
+  if (!dateValue) return "";
+  const date = new Date(dateValue);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+};
+
+const getPodcastImageUrl = (channelXml) => {
+  const itunesImage = getXmlTagAttribute(channelXml, "image", "href", { allowPrefix: true });
+  const imageXml = extractXmlBlocks(channelXml, "image")[0] || "";
+  const imageUrl = getXmlTagText(imageXml, "url");
+  return isHttpUrl(itunesImage) ? itunesImage : isHttpUrl(imageUrl) ? imageUrl : null;
+};
+
+const getEpisodeAudio = (itemXml) => {
+  const audioUrl = getXmlTagAttribute(itemXml, "enclosure", "url");
+  const audioType = getXmlTagAttribute(itemXml, "enclosure", "type");
+  return {
+    audioUrl: isHttpUrl(audioUrl) ? audioUrl : "",
+    audioType: audioType || "",
+  };
+};
+
+const parsePodcastFeed = (xml) => {
+  const channelMatch = String(xml || "").match(/<channel\b[^>]*>([\s\S]*?)<\/channel>/i);
+  if (!channelMatch) {
+    throw createExposedError("We could not read that Podcast Link. Try a different link.");
+  }
+
+  const channelXml = channelMatch[1];
+  const itemBlocks = extractXmlBlocks(channelXml, "item");
+  const episodes = itemBlocks.map((itemXml, index) => {
+    const publishedAt = normalizeIsoDate(getXmlTagText(itemXml, "pubDate"));
+    const audio = getEpisodeAudio(itemXml);
+    return {
+      index,
+      title: getXmlTagText(itemXml, "title") || "Untitled episode",
+      publishedAt,
+      guid: getXmlTagText(itemXml, "guid"),
+      audioUrl: audio.audioUrl,
+      audioType: audio.audioType,
+    };
+  });
+
+  const latestEpisode = episodes
+    .slice()
+    .sort((first, second) => {
+      if (!first.publishedAt && !second.publishedAt) return first.index - second.index;
+      if (!first.publishedAt) return 1;
+      if (!second.publishedAt) return -1;
+      return new Date(second.publishedAt).getTime() - new Date(first.publishedAt).getTime();
+    })[0] || null;
+
+  const warnings = [];
+  if (latestEpisode && !latestEpisode.audioUrl) {
+    warnings.push("No audio file was found in the latest episode.");
+  }
+
+  return {
+    title: getXmlTagText(channelXml, "title") || "Untitled podcast",
+    description:
+      getXmlTagText(channelXml, "description") ||
+      getXmlTagText(channelXml, "summary", { allowPrefix: true }),
+    imageUrl: getPodcastImageUrl(channelXml),
+    latestEpisode: latestEpisode
+      ? {
+          title: latestEpisode.title,
+          publishedAt: latestEpisode.publishedAt,
+          audioUrl: latestEpisode.audioUrl,
+          audioType: latestEpisode.audioType,
+          guid: latestEpisode.guid,
+        }
+      : null,
+    episodeCount: episodes.length,
+    warnings,
+  };
+};
+
+const fetchPodcastFeedXml = async (podcastLink, redirectCount = 0) => {
+  if (redirectCount > PODCAST_FEED_MAX_REDIRECTS) {
+    throw createExposedError("That Podcast Link redirected too many times.", 502);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PODCAST_FEED_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(podcastLink, {
+      headers: {
+        Accept: "application/rss+xml, application/xml, text/xml, */*",
+        "User-Agent": "FeedYourYoto/0.1 (+https://github.com/cjredmo/feed-your-yoto)",
+      },
+      redirect: "manual",
+      signal: controller.signal,
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw createExposedError("The podcast site redirected without a new link.", 502);
+      }
+
+      const nextUrl = new URL(location, podcastLink).toString();
+      if (!isHttpUrl(nextUrl)) {
+        throw createExposedError("Podcast Link should start with http or https.");
+      }
+      return fetchPodcastFeedXml(nextUrl, redirectCount + 1);
+    }
+
+    if (!response.ok) {
+      throw createExposedError("The podcast site could not be reached.", 502);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) return "";
+
+    const decoder = new TextDecoder();
+    let receivedBytes = 0;
+    let xml = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      receivedBytes += value.byteLength;
+      if (receivedBytes > PODCAST_FEED_MAX_BYTES) {
+        throw createExposedError("That Podcast Link is too large to check.");
+      }
+      xml += decoder.decode(value, { stream: true });
+    }
+
+    xml += decoder.decode();
+    return xml;
+  } catch (error) {
+    if (error.expose) throw error;
+    if (error.name === "AbortError") {
+      throw createExposedError("The podcast site took too long to answer.", 502);
+    }
+    throw createExposedError("The podcast site could not be reached.", 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const previewPodcast = async (body) => {
+  const podcastLink = validatePodcastLink(body.podcastLink);
+  const xml = await fetchPodcastFeedXml(podcastLink);
+
+  try {
+    return parsePodcastFeed(xml);
+  } catch (error) {
+    if (error.expose) throw error;
+    throw createExposedError("We could not read that Podcast Link. Try a different link.");
+  }
+};
+
 const slugify = (value) =>
   String(value || "story-card")
     .trim()
@@ -183,6 +399,20 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     id: existingCard.id,
     name: String(body.name || "").trim(),
     podcastLink: String(body.podcastLink || "").trim(),
+    podcastTitle: String(body.podcastTitle ?? existingCard.podcastTitle ?? "").trim(),
+    podcastDescription: String(body.podcastDescription ?? existingCard.podcastDescription ?? "").trim(),
+    podcastImageUrl: isHttpUrl(body.podcastImageUrl ?? existingCard.podcastImageUrl)
+      ? body.podcastImageUrl ?? existingCard.podcastImageUrl
+      : null,
+    latestEpisodeTitle: String(body.latestEpisodeTitle ?? existingCard.latestEpisodeTitle ?? "").trim(),
+    latestEpisodePublishedAt: String(
+      body.latestEpisodePublishedAt ?? existingCard.latestEpisodePublishedAt ?? ""
+    ).trim(),
+    latestEpisodeGuid: String(body.latestEpisodeGuid ?? existingCard.latestEpisodeGuid ?? "").trim(),
+    latestEpisodeAudioUrl: isHttpUrl(body.latestEpisodeAudioUrl ?? existingCard.latestEpisodeAudioUrl)
+      ? body.latestEpisodeAudioUrl ?? existingCard.latestEpisodeAudioUrl
+      : "",
+    lastPreviewedAt: String(body.lastPreviewedAt ?? existingCard.lastPreviewedAt ?? "").trim(),
     yotoPlaylistId: String(body.yotoPlaylistId || "").trim(),
     yotoPlaylistTitle: String(body.yotoPlaylistTitle || "Story Playlist").trim(),
     yotoPlaylistImageUrl: isHttpUrl(body.yotoPlaylistImageUrl)
@@ -203,6 +433,24 @@ const isPlaylistUsedByStoryCard = (storyCards, playlistId, ignoreStoryCardId = "
     (storyCard) =>
       storyCard.id !== ignoreStoryCardId && storyCard.yotoPlaylistId === playlistId
   );
+
+const normalizeDangerousValue = (value) => (value == null ? "" : String(value).trim());
+
+const didDangerousStoryCardFieldChange = (currentStoryCard, body) => {
+  const dangerousFields = [
+    "name",
+    "podcastLink",
+    "yotoPlaylistId",
+    "yotoPlaylistTitle",
+    "yotoPlaylistImageUrl",
+  ];
+
+  return dangerousFields.some(
+    (field) =>
+      Object.prototype.hasOwnProperty.call(body, field) &&
+      normalizeDangerousValue(body[field]) !== normalizeDangerousValue(currentStoryCard[field])
+  );
+};
 
 const createStoryCard = async (body) => {
   const storyCards = await readStoryCards();
@@ -254,6 +502,20 @@ const updateStoryCard = async (id, body) => {
     error.status = 404;
     error.expose = true;
     throw error;
+  }
+
+  if (didDangerousStoryCardFieldChange(storyCards[index], body)) {
+    if (body.setupChangeAcknowledged !== true) {
+      throw createExposedError("Unlock setup details before changing this Story Card.");
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(body, "yotoPlaylistId") &&
+      body.yotoPlaylistId !== storyCards[index].yotoPlaylistId &&
+      isPlaylistUsedByStoryCard(storyCards, body.yotoPlaylistId, id)
+    ) {
+      throw createExposedError("This Story Playlist is already connected to another Story Card.");
+    }
   }
 
   const merged = {
@@ -788,6 +1050,11 @@ const handleApi = async (request, response, pathname) => {
 
     if (request.method === "GET" && pathname === "/api/yoto/cards") {
       sendJson(response, 200, await getSafeYotoCards());
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/podcast/preview") {
+      sendJson(response, 200, await previewPodcast(await readRequestJson(request)));
       return;
     }
 

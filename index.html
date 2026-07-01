@@ -136,18 +136,18 @@
           <div class="field-grid">
             <label class="field">
               <span>Story Card Name</span>
-              <input id="playlistName" type="text" value="Story Station" />
+              <input id="playlistName" type="text" value="Story Station" disabled />
             </label>
 
             <label class="field">
               <span>Podcast Link</span>
-              <input id="rssFeed" type="url" value="https://example.com/story-station.xml" />
+              <input id="rssFeed" type="url" value="https://example.com/story-station.xml" disabled />
               <small>Paste the podcast's RSS feed link here.</small>
             </label>
 
             <label class="field">
               <span>Story Playlist</span>
-              <select id="yotoCard">
+              <select id="yotoCard" disabled>
                 <option>Choose a Story Playlist</option>
               </select>
             </label>
@@ -155,6 +155,25 @@
             <label class="field">
               <span>Next Check</span>
               <input id="nextCrawl" type="datetime-local" value="2026-06-28T19:30" />
+            </label>
+          </div>
+
+          <div class="setup-lock-row">
+            <button id="changeSetupDetails" class="outline-action" type="button">Change setup details</button>
+          </div>
+
+          <div id="setupDetailsPanel" class="setup-details-panel" hidden>
+            <div class="setup-warning" role="note">
+              <strong>Grown-up note</strong>
+              <span>Changing the Story Card name, Podcast Link, or Story Playlist can affect what Feed Your Yoto syncs. Only change these if you are fixing the setup.</span>
+            </div>
+            <label class="setup-checkbox">
+              <input id="setupChangeAcknowledged" type="checkbox" />
+              <span>I understand this changes the setup for this Story Card.</span>
+            </label>
+            <label class="field setup-change-code">
+              <span>Type CHANGE to edit the Podcast Link</span>
+              <input id="podcastChangeCode" type="text" autocomplete="off" />
             </label>
           </div>
 

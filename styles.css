@@ -1196,6 +1196,39 @@ h2 {
   outline: none;
 }
 
+.setup-lock-row {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.setup-details-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 2px solid #e5d48b;
+  border-radius: 8px;
+  background: #fffdf0;
+}
+
+.setup-details-panel .setup-warning {
+  margin-bottom: 0;
+}
+
+.setup-details-panel .setup-checkbox {
+  margin-bottom: 0;
+}
+
+.setup-change-code {
+  max-width: 340px;
+}
+
+.field input:disabled,
+.field select:disabled {
+  color: #6d7791;
+  background: #f3f4fa;
+  cursor: not-allowed;
+}
+
 .switch-row {
   min-height: 76px;
   display: flex;
@@ -1614,6 +1647,100 @@ h2 {
 .setup-field-stack {
   display: grid;
   gap: 18px;
+}
+
+.podcast-check-row {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: -4px;
+}
+
+.podcast-preview-region {
+  min-height: 0;
+}
+
+.podcast-preview-message,
+.podcast-preview-error {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1.35;
+}
+
+.podcast-preview-message {
+  color: var(--blue-dark);
+  background: var(--blue-soft);
+}
+
+.podcast-preview-error {
+  color: #8a1e31;
+  background: #ffe1e8;
+}
+
+.podcast-preview-card {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 2px solid #d9dded;
+  border-radius: 8px;
+  background: #f7f8fc;
+}
+
+.podcast-preview-art {
+  width: 88px;
+  height: 88px;
+  display: block;
+}
+
+.podcast-preview-image,
+.podcast-preview-placeholder {
+  width: 88px;
+  height: 88px;
+  border-radius: 8px;
+}
+
+.podcast-preview-image {
+  display: block;
+  object-fit: cover;
+}
+
+.podcast-preview-copy {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.podcast-preview-label {
+  margin: 0;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.podcast-preview-copy strong {
+  color: var(--blue-dark);
+  font-size: 17px;
+  line-height: 1.25;
+}
+
+.podcast-preview-copy span {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
+.podcast-preview-copy .podcast-preview-ok {
+  color: #11633d;
+}
+
+.podcast-preview-copy .podcast-preview-warning {
+  color: #8a1e31;
 }
 
 .setup-label {

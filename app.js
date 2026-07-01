@@ -62,6 +62,10 @@ const playlistName = document.querySelector("#playlistName");
 const rssFeed = document.querySelector("#rssFeed");
 const yotoCard = document.querySelector("#yotoCard");
 const nextCrawl = document.querySelector("#nextCrawl");
+const changeSetupDetails = document.querySelector("#changeSetupDetails");
+const setupDetailsPanel = document.querySelector("#setupDetailsPanel");
+const setupChangeAcknowledged = document.querySelector("#setupChangeAcknowledged");
+const podcastChangeCode = document.querySelector("#podcastChangeCode");
 const closeDialog = document.querySelector("#closeDialog");
 const addCardButton = document.querySelector("#addCardButton");
 const showAllButton = document.querySelector("#showAllButton");
@@ -83,6 +87,7 @@ let yotoLoginPopup = null;
 let setupStep = 0;
 let setupDraft = getFreshSetupDraft();
 let yotoCardsLoadId = 0;
+let setupDetailsUnlocked = false;
 
 function getFreshSetupDraft() {
   return {
@@ -94,6 +99,10 @@ function getFreshSetupDraft() {
     overwriteAcknowledged: false,
     name: "",
     podcastLink: "",
+    podcastPreview: null,
+    podcastPreviewStatus: "idle",
+    podcastPreviewMessage: "",
+    podcastPreviewLink: "",
     updateRhythm: "daily",
     lateCheckRhythm: "hourly",
   };
@@ -448,6 +457,63 @@ const renderPlaylistModeTabs = () => `
   </div>
 `;
 
+const renderPodcastPreview = () => {
+  if (setupDraft.podcastPreviewStatus === "loading") {
+    return `<p class="podcast-preview-message" role="status">Checking podcast...</p>`;
+  }
+
+  if (setupDraft.podcastPreviewStatus === "error") {
+    return `<p class="podcast-preview-error" role="alert">${escapeHtml(setupDraft.podcastPreviewMessage)}</p>`;
+  }
+
+  const preview = setupDraft.podcastPreview;
+  if (!preview) return "";
+
+  const latestEpisode = preview.latestEpisode || {};
+  const warning = preview.warnings?.[0] || "";
+  const episodeDate = latestEpisode.publishedAt ? formatDateTime(latestEpisode.publishedAt) : "";
+
+  return `
+    <article class="podcast-preview-card">
+      ${
+        preview.imageUrl
+          ? `<span class="podcast-preview-art">
+              <img class="podcast-preview-image" src="${escapeAttribute(preview.imageUrl)}" alt="" onerror="this.hidden=true; this.nextElementSibling.hidden=false;" />
+              <span class="playlist-art-placeholder podcast-preview-placeholder" aria-hidden="true" hidden>${escapeHtml(getPlaylistInitials(preview.title))}</span>
+            </span>`
+          : `<span class="playlist-art-placeholder podcast-preview-placeholder" aria-hidden="true">${escapeHtml(getPlaylistInitials(preview.title))}</span>`
+      }
+      <div class="podcast-preview-copy">
+        <p class="podcast-preview-label">Podcast found</p>
+        <strong>${escapeHtml(preview.title || "Untitled podcast")}</strong>
+        ${preview.description ? `<span>${escapeHtml(preview.description)}</span>` : ""}
+        ${latestEpisode.title ? `<span>Latest: ${escapeHtml(latestEpisode.title)}</span>` : ""}
+        ${episodeDate ? `<span>${escapeHtml(episodeDate)}</span>` : ""}
+        <span class="${warning ? "podcast-preview-warning" : "podcast-preview-ok"}">${escapeHtml(warning || "Audio file found")}</span>
+      </div>
+    </article>
+  `;
+};
+
+const getPodcastPreviewPayload = () => {
+  if (!setupDraft.podcastPreview || setupDraft.podcastPreviewLink !== setupDraft.podcastLink.trim()) {
+    return {};
+  }
+
+  const preview = setupDraft.podcastPreview;
+  const latestEpisode = preview.latestEpisode || {};
+  return {
+    podcastTitle: preview.title || "",
+    podcastDescription: preview.description || "",
+    podcastImageUrl: preview.imageUrl || null,
+    latestEpisodeTitle: latestEpisode.title || "",
+    latestEpisodePublishedAt: latestEpisode.publishedAt || "",
+    latestEpisodeGuid: latestEpisode.guid || "",
+    latestEpisodeAudioUrl: latestEpisode.audioUrl || "",
+    lastPreviewedAt: new Date().toISOString(),
+  };
+};
+
 const canContinueFromPlaylistStep = () => {
   if (setupDraft.playlistMode === "create") {
     return Boolean(setupDraft.newPlaylistTitle.trim());
@@ -549,7 +615,7 @@ function renderCards() {
             </div>
             <div>
               <span>Podcast Link</span>
-              <strong>${escapeHtml(getPodcastPreview(storyCard.podcastLink))}</strong>
+              <strong>${escapeHtml(storyCard.podcastTitle || getPodcastPreview(storyCard.podcastLink))}</strong>
             </div>
             <div>
               <span>Next Check</span>
@@ -586,6 +652,40 @@ const setSwitch = (isOn) => {
   switchStatus.textContent = isOn ? "On and watching" : "Off for now";
 };
 
+const isSetupChangeAcknowledged = () => Boolean(setupChangeAcknowledged?.checked);
+
+const isPodcastChangeConfirmed = () =>
+  String(podcastChangeCode?.value || "").trim().toUpperCase() === "CHANGE";
+
+const canEditSetupDetails = () => setupDetailsUnlocked && isSetupChangeAcknowledged();
+
+const refreshSetupDetailLocks = () => {
+  const setupEditable = canEditSetupDetails();
+  const podcastEditable = setupEditable && isPodcastChangeConfirmed();
+
+  playlistName.disabled = !setupEditable;
+  yotoCard.disabled = !setupEditable;
+  rssFeed.disabled = !podcastEditable;
+  if (podcastChangeCode) podcastChangeCode.disabled = !setupDetailsUnlocked;
+};
+
+const resetEditorSetupLock = () => {
+  setupDetailsUnlocked = false;
+  setupDetailsPanel.hidden = true;
+  changeSetupDetails.hidden = false;
+  if (setupChangeAcknowledged) setupChangeAcknowledged.checked = false;
+  if (podcastChangeCode) podcastChangeCode.value = "";
+  refreshSetupDetailLocks();
+};
+
+const showSetupDetailsPanel = () => {
+  setupDetailsUnlocked = true;
+  setupDetailsPanel.hidden = false;
+  changeSetupDetails.hidden = true;
+  refreshSetupDetailLocks();
+  setupChangeAcknowledged.focus();
+};
+
 const hideDeleteConfirmation = () => {
   deleteConfirmPanel.hidden = true;
   deleteCard.hidden = false;
@@ -602,32 +702,42 @@ const showDeleteConfirmation = () => {
 const populateEditorPlaylistOptions = (storyCard) => {
   const currentId = storyCard.yotoPlaylistId || storyCard.yotoCardId || "";
   const currentTitle = getStoryCardPlaylistTitle(storyCard);
-  const options = getRegularYotoPlaylists().map((card) => ({
-    id: card.id,
-    title: getYotoCardTitle(card),
-  }));
+  const options = getRegularYotoPlaylists().map((card) => {
+    const usedStoryCard = getUsedStoryCardForPlaylist(card.id);
+    return {
+      id: card.id,
+      title: getYotoCardTitle(card),
+      disabled: Boolean(usedStoryCard && usedStoryCard.id !== storyCard.id),
+      usedBy: usedStoryCard?.name || "",
+    };
+  });
 
   if (currentId && !options.some((option) => option.id === currentId)) {
     options.unshift({
       id: currentId,
       title: currentTitle,
+      disabled: false,
+      usedBy: "",
     });
   }
 
   yotoCard.innerHTML = options.length
     ? options
-        .map(
-          (option) =>
-            `<option value="${escapeAttribute(option.id)}">${escapeHtml(option.title)}</option>`
-        )
+        .map((option) => {
+          const label = option.disabled
+            ? `${option.title} - already used by ${option.usedBy}`
+            : option.title;
+          return `<option value="${escapeAttribute(option.id)}" ${option.disabled ? "disabled" : ""}>${escapeHtml(label)}</option>`;
+        })
         .join("")
     : `<option value="${escapeAttribute(currentId)}">${escapeHtml(currentTitle)}</option>`;
-  yotoCard.value = currentId || options[0]?.id || "";
+  yotoCard.value = currentId || options.find((option) => !option.disabled)?.id || "";
 };
 
 const openEditor = (storyCard) => {
   activeCardId = storyCard.id;
   hideDeleteConfirmation();
+  resetEditorSetupLock();
 
   dialogArt.className = "dialog-cover card-picture playlist-card-picture";
   dialogArt.innerHTML = getStoryCardArtMarkup(storyCard);
@@ -651,6 +761,7 @@ const openEditor = (storyCard) => {
 
 const closeEditor = () => {
   hideDeleteConfirmation();
+  resetEditorSetupLock();
   backdrop.hidden = true;
   setModalLock();
 };
@@ -694,24 +805,35 @@ const saveActiveCard = async () => {
   const updateRhythm = selectedFrequency?.dataset.frequency || activeCard.updateRhythm;
   const previousText = setButtonBusy(saveCard, true, "Saving...");
 
+  const updatePayload = {
+    updateRhythm,
+    lateCheckRhythm:
+      updateRhythm === "manual"
+        ? ""
+        : selectedLateFrequency?.dataset.lateFrequency || activeCard.lateCheckRhythm,
+    status: syncSwitch.classList.contains("is-on") ? "Updating" : "Taking a Break",
+    statusType: syncSwitch.classList.contains("is-on") ? "live" : "paused",
+    nextCheck: updateRhythm === "manual" ? "" : nextCrawl.value,
+  };
+
+  if (canEditSetupDetails()) {
+    updatePayload.setupChangeAcknowledged = true;
+    updatePayload.name = playlistName.value.trim();
+    updatePayload.yotoPlaylistId =
+      selectedYotoCard?.id || activeCard.yotoPlaylistId || activeCard.yotoCardId;
+    updatePayload.yotoPlaylistTitle = selectedYotoCard
+      ? getYotoCardTitle(selectedYotoCard)
+      : getStoryCardPlaylistTitle(activeCard);
+    updatePayload.yotoPlaylistImageUrl =
+      selectedYotoCard?.imageUrl || getStoryCardPlaylistImageUrl(activeCard);
+
+    if (isPodcastChangeConfirmed()) {
+      updatePayload.podcastLink = rssFeed.value.trim();
+    }
+  }
+
   try {
-    await jsonRequest(`/api/story-cards/${encodeURIComponent(activeCard.id)}`, "PUT", {
-      name: playlistName.value.trim(),
-      podcastLink: rssFeed.value.trim(),
-      yotoPlaylistId: selectedYotoCard?.id || activeCard.yotoPlaylistId || activeCard.yotoCardId,
-      yotoPlaylistTitle: selectedYotoCard
-        ? getYotoCardTitle(selectedYotoCard)
-        : getStoryCardPlaylistTitle(activeCard),
-      yotoPlaylistImageUrl: selectedYotoCard?.imageUrl || getStoryCardPlaylistImageUrl(activeCard),
-      updateRhythm,
-      lateCheckRhythm:
-        updateRhythm === "manual"
-          ? ""
-          : selectedLateFrequency?.dataset.lateFrequency || activeCard.lateCheckRhythm,
-      status: syncSwitch.classList.contains("is-on") ? "Updating" : "Taking a Break",
-      statusType: syncSwitch.classList.contains("is-on") ? "live" : "paused",
-      nextCheck: updateRhythm === "manual" ? "" : nextCrawl.value,
-    });
+    await jsonRequest(`/api/story-cards/${encodeURIComponent(activeCard.id)}`, "PUT", updatePayload);
     await loadStoryCards();
     closeEditor();
   } catch (error) {
@@ -924,6 +1046,14 @@ const renderSetupStep = () => {
           <input id="setupPodcastLink" type="url" value="${escapeAttribute(setupDraft.podcastLink)}" autocomplete="off" />
           <small>Paste the podcast's RSS feed link here.</small>
         </label>
+        <div class="podcast-check-row">
+          <button class="outline-action" type="button" data-check-podcast-link ${setupDraft.podcastPreviewStatus === "loading" ? "disabled" : ""}>
+            Check Podcast Link
+          </button>
+        </div>
+        <div class="podcast-preview-region">
+          ${renderPodcastPreview()}
+        </div>
       </div>
     `;
     return;
@@ -1088,6 +1218,38 @@ const getNewStoryCardTiming = () => {
   };
 };
 
+const checkPodcastLink = async () => {
+  const podcastError = validatePodcastLink(setupDraft.podcastLink);
+  if (podcastError) {
+    setupDraft.podcastPreviewStatus = "error";
+    setupDraft.podcastPreviewMessage = podcastError;
+    setupDraft.podcastPreview = null;
+    renderSetupStep();
+    return;
+  }
+
+  setupDraft.podcastPreviewStatus = "loading";
+  setupDraft.podcastPreviewMessage = "";
+  renderSetupStep();
+
+  try {
+    const preview = await jsonRequest("/api/podcast/preview", "POST", {
+      podcastLink: setupDraft.podcastLink.trim(),
+    });
+    setupDraft.podcastPreview = preview;
+    setupDraft.podcastPreviewStatus = "success";
+    setupDraft.podcastPreviewMessage = "";
+    setupDraft.podcastPreviewLink = setupDraft.podcastLink.trim();
+  } catch (error) {
+    setupDraft.podcastPreview = null;
+    setupDraft.podcastPreviewStatus = "error";
+    setupDraft.podcastPreviewMessage = error.message || "Could not check this Podcast Link.";
+    setupDraft.podcastPreviewLink = "";
+  }
+
+  renderSetupStep();
+};
+
 const saveSetupStoryCard = async () => {
   const error = getSetupDraftError();
   if (error) {
@@ -1127,6 +1289,7 @@ const saveSetupStoryCard = async () => {
       status: "Updating",
       statusType: "live",
       nextCheck: timing.value,
+      ...getPodcastPreviewPayload(),
     });
     await loadStoryCards();
     closeSetupFlow();
@@ -1308,6 +1471,14 @@ pauseCard.addEventListener("click", () => {
   setSwitch(false);
 });
 
+changeSetupDetails.addEventListener("click", () => {
+  if (!requireAuth("Connect Yoto to change setup details.")) return;
+  showSetupDetailsPanel();
+});
+
+setupChangeAcknowledged.addEventListener("change", refreshSetupDetailLocks);
+podcastChangeCode.addEventListener("input", refreshSetupDetailLocks);
+
 deleteCard.addEventListener("click", showDeleteConfirmation);
 cancelDeleteCard.addEventListener("click", hideDeleteConfirmation);
 confirmDeleteCard.addEventListener("click", deleteActiveCard);
@@ -1322,6 +1493,12 @@ setupStepContent.addEventListener("click", (event) => {
     setupDraft.overwriteAcknowledged = false;
     chooseDefaultSetupPlaylist();
     renderSetupStep();
+    return;
+  }
+
+  const checkPodcastButton = event.target.closest("[data-check-podcast-link]");
+  if (checkPodcastButton) {
+    checkPodcastLink();
     return;
   }
 
@@ -1367,6 +1544,11 @@ setupStepContent.addEventListener("input", (event) => {
 
   if (event.target.id === "setupPodcastLink") {
     setupDraft.podcastLink = event.target.value;
+    if (setupDraft.podcastPreviewLink !== setupDraft.podcastLink.trim()) {
+      setupDraft.podcastPreview = null;
+      setupDraft.podcastPreviewStatus = "idle";
+      setupDraft.podcastPreviewMessage = "";
+    }
   }
 });
 
