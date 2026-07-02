@@ -23,6 +23,7 @@ let storyQueueState = {
 let storyDownloadState = {
   storyIds: new Set(),
   bulk: false,
+  processing: false,
 };
 
 const storyStatusLabels = {
@@ -887,22 +888,53 @@ const renderStoryTracker = (story, group = "new") => {
   `;
 };
 
-const renderBringStoriesHomePanel = (preview) => {
-  const onYotoStories = preview.onYotoSoon || [];
-  const storiesToBringHome = onYotoStories.filter(isStoryReadyToBringHome);
-  const hasOnYotoStories = onYotoStories.length > 0;
+const getStoriesNeedingPreparation = (preview) =>
+  (preview.onYotoSoon || []).filter(isStoryReadyToBringHome);
+
+const renderStoryStatusSummary = (preview) => {
+  const storiesToPrepare = getStoriesNeedingPreparation(preview).length;
+  const needsHelpCount = storyQueueState.stories.filter((story) => story.status === "failed").length;
+  const isAutomaticMode = getEditorStoryRules().newStoryBehavior !== "choose_first";
+
+  return `
+    <section class="story-status-summary" aria-labelledby="storyPlaylistStatusTitle">
+      <div>
+        <p class="section-kicker">Story Playlist Status</p>
+        <h4 id="storyPlaylistStatusTitle">Story Playlist Status</h4>
+        <p>Feed Your Yoto keeps this Story Playlist filled from the Podcast Link.</p>
+      </div>
+      <div class="story-summary-counts" aria-label="Story Playlist counts">
+        <span><strong>${preview.onYotoSoon.length}</strong> On Yoto soon</span>
+        <span><strong>${preview.newStories.length}</strong> New stories</span>
+        <span><strong>${preview.favorites.length}</strong> Favorites</span>
+        <span><strong>${needsHelpCount}</strong> Needs help</span>
+      </div>
+      ${
+        isAutomaticMode
+          ? `<p class="story-auto-note">${
+              storyDownloadState.processing
+                ? "Getting stories ready..."
+                : storiesToPrepare
+                  ? "Feed Your Yoto will get picked stories ready automatically."
+                  : "Everything picked is ready for the next step."
+            }</p>`
+          : renderManualPreparePanel(storiesToPrepare)
+      }
+    </section>
+  `;
+};
+
+const renderManualPreparePanel = (storiesToPrepare) => {
   const busy = storyDownloadState.bulk;
-  const helper = hasOnYotoStories
-    ? storiesToBringHome.length
-      ? `${storiesToBringHome.length} ${storiesToBringHome.length === 1 ? "story is" : "stories are"} ready for the next step.`
-      : "Stories picked for Yoto are already ready or waiting for the next step."
-    : "Pick a story first, then Feed Your Yoto can get it ready.";
+  const helper = storiesToPrepare.length
+    ? `${storiesToPrepare.length} ${storiesToPrepare.length === 1 ? "story is" : "stories are"} ready for the next step.`
+    : "Pick a story first, then Feed Your Yoto can prepare it.";
 
   return `
     <div class="story-download-panel">
       <p>${escapeHtml(helper)}</p>
-      <button class="outline-action" type="button" data-download-selected ${!storiesToBringHome.length || busy ? "disabled" : ""}>
-        ${busy ? "Getting stories ready..." : "Get Stories Ready"}
+      <button class="outline-action" type="button" data-download-selected ${!storiesToPrepare.length || busy ? "disabled" : ""}>
+        ${busy ? "Preparing stories..." : "Prepare Stories"}
       </button>
     </div>
   `;
@@ -1019,7 +1051,7 @@ const renderStoryQueue = () => {
     ${lastCheckedMarkup}
     ${queueMessageMarkup}
     ${pendingMarkup}
-    ${renderBringStoriesHomePanel(preview)}
+    ${renderStoryStatusSummary(preview)}
     ${renderStoryFilterTags(preview, storyQueueState.stories.length)}
     ${
       filteredStories.length
@@ -1035,17 +1067,20 @@ const renderStoryQueue = () => {
 };
 
 const getStoryControlsForGroup = (story, group) => {
+  if (getEditorStoryRules().newStoryBehavior !== "choose_first") return [];
+
   if (group === "new") {
-    return getEditorStoryRules().newStoryBehavior === "choose_first"
-      ? [{ action: "select", label: "Pick for Yoto", active: story.isSelected }]
-      : [];
+    return [
+      { action: "select", label: "Pick for Yoto", active: story.isSelected },
+      { action: "skip", label: "Skip for now", active: story.isSkipped },
+    ];
   }
 
   if (group === "on_yoto") {
     return story.isPinned
       ? [{ action: "pin", label: "Remove Favorite", active: true }]
       : [
-          { action: "remove", label: "Remove from Card", active: false },
+          { action: "remove", label: "Remove from Playlist", active: false },
           { action: "pin", label: "Keep Favorite", active: false },
         ];
   }
@@ -1058,7 +1093,10 @@ const getStoryControlsForGroup = (story, group) => {
 };
 
 const renderStoryDownloadAction = (story, group) => {
-  const canShowButton = group === "on_yoto" || story.isSelected || story.status === "selected" || story.status === "failed";
+  const isManualMode = getEditorStoryRules().newStoryBehavior === "choose_first";
+  const canShowButton =
+    story.status === "failed" ||
+    (isManualMode && (group === "on_yoto" || story.isSelected || story.status === "selected"));
   const isBusy = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
 
   if (!canShowButton) return "";
@@ -1069,7 +1107,7 @@ const renderStoryDownloadAction = (story, group) => {
 
   if (!isStoryReadyToBringHome(story)) return "";
 
-  return `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Get Story Ready"}</button>`;
+  return `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Prepare Story"}</button>`;
 };
 
 const renderQueuedStory = (story, group = "new") => {
@@ -1127,6 +1165,7 @@ const loadStoryQueue = async (storyCardId, { discoverIfEmpty = false } = {}) => 
     }
 
     setStoryQueueState({ status: "loaded", stories: queueStories, message: "", pendingUpdates: {} });
+    maybeProcessStoriesForStoryCard(storyCardId);
   } catch (error) {
     setStoryQueueState({
       status: "error",
@@ -1155,6 +1194,7 @@ const discoverStories = async (storyCardId = activeCardId) => {
       message: "",
       pendingUpdates: {},
     });
+    maybeProcessStoriesForStoryCard(storyCardId);
   } catch (error) {
     setStoryQueueState({
       status: "error",
@@ -1272,16 +1312,51 @@ const downloadQueuedStory = async (storyId) => {
   }
 };
 
+const processStoriesForStoryCard = async (storyCardId) => {
+  if (!storyCardId || getEditorStoryRules().newStoryBehavior === "choose_first") return;
+  if (storyDownloadState.processing) return;
+
+  const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
+  const storiesToPrepare = getStoriesNeedingPreparation(preview);
+  if (!storiesToPrepare.length) return;
+
+  setStoryDownloadState({ processing: true });
+
+  try {
+    const result = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/download-selected`,
+      "POST"
+    );
+    setStoryQueueState({
+      status: "loaded",
+      message: result.failed?.length ? "Some stories need help before they can get ready." : "",
+      stories: Array.isArray(result.stories) ? result.stories : storyQueueState.stories,
+      pendingUpdates: {},
+    });
+  } catch (error) {
+    setStoryQueueState({
+      status: "loaded",
+      message: error.message || "Feed Your Yoto could not get stories ready.",
+    });
+  } finally {
+    setStoryDownloadState({ processing: false });
+  }
+};
+
+const maybeProcessStoriesForStoryCard = (storyCardId) => {
+  window.setTimeout(() => processStoriesForStoryCard(storyCardId), 0);
+};
+
 const downloadSelectedStories = async () => {
   if (!activeCardId) return;
 
   const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
-  const storiesToBringHome = (preview.onYotoSoon || []).filter(isStoryReadyToBringHome);
+  const storiesToPrepare = getStoriesNeedingPreparation(preview);
 
-  if (!storiesToBringHome.length) {
+  if (!storiesToPrepare.length) {
     setStoryQueueState({
       status: "loaded",
-      message: "Pick a story first, then Feed Your Yoto can get it ready.",
+      message: "Pick a story first, then Feed Your Yoto can prepare it.",
     });
     return;
   }
@@ -2170,6 +2245,9 @@ newStoryBehaviorButtons.forEach((button) => {
       option.classList.toggle("is-selected", option === button);
     });
     renderStoryQueue();
+    if (button.dataset.newStoryBehavior === "auto_pick") {
+      maybeProcessStoriesForStoryCard(activeCardId);
+    }
   });
 });
 
