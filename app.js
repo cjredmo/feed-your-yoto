@@ -19,14 +19,39 @@ let storyQueueState = {
   stories: [],
   pendingUpdates: {},
 };
+let storyDownloadState = {
+  storyIds: new Set(),
+  bulk: false,
+};
 
 const storyStatusLabels = {
   discovered: "New story found",
   selected: "Picked for Yoto",
   skipped: "Skipped for now",
+  downloading: "Getting story ready",
+  downloaded: "Story ready to send",
+  uploaded: "Story sent",
+  adding_to_playlist: "Adding to Story Playlist",
   synced: "Ready on Yoto",
+  cleaning_local: "Tidying up",
   rotated_off: "Old story resting",
   failed: "Needs help",
+};
+
+const storyTrackerSteps = [
+  { key: "discovered", label: "New story found" },
+  { key: "selected", label: "Picked for Yoto" },
+  { key: "downloading", label: "Getting story ready" },
+  { key: "downloaded", label: "Story ready to send" },
+  { key: "uploaded", label: "Sending story to Yoto" },
+  { key: "adding_to_playlist", label: "Adding to Story Playlist" },
+  { key: "synced", label: "Ready on Yoto" },
+];
+
+const defaultStoryRules = {
+  newStoryBehavior: "auto_pick",
+  playlistLimit: 10,
+  favoritesNeverRotate: true,
 };
 
 const updateRhythmOptions = [
@@ -95,10 +120,14 @@ const syncSwitch = document.querySelector("#syncSwitch");
 const switchStatus = document.querySelector("#switchStatus");
 const refreshStories = document.querySelector("#refreshStories");
 const storyQueueContent = document.querySelector("#storyQueueContent");
+const favoritesNeverRotate = document.querySelector("#favoritesNeverRotate");
 const frequencyButtons = Array.from(document.querySelectorAll("[data-frequency]"));
 const lateFrequencyButtons = Array.from(document.querySelectorAll("[data-late-frequency]"));
+const newStoryBehaviorButtons = Array.from(document.querySelectorAll("[data-new-story-behavior]"));
 const editorTabs = Array.from(document.querySelectorAll("[data-editor-tab]"));
 const editorPanels = Array.from(document.querySelectorAll("[data-editor-panel]"));
+const storySubtabs = Array.from(document.querySelectorAll("[data-stories-subtab]"));
+const storySubpanels = Array.from(document.querySelectorAll("[data-stories-subpanel]"));
 
 let activeCardId = "";
 let isAuthenticated = false;
@@ -691,9 +720,196 @@ const setEditorTab = (tabName = "stories") => {
   });
 };
 
+const normalizePlaylistLimitValue = (value) => {
+  if (value === "all") return "all";
+  const numericValue = Number(value);
+  return [5, 10, 15].includes(numericValue) ? numericValue : 10;
+};
+
+const getStoryRules = (storyCard = {}) => ({
+  newStoryBehavior: ["auto_pick", "choose_first"].includes(storyCard.newStoryBehavior)
+    ? storyCard.newStoryBehavior
+    : defaultStoryRules.newStoryBehavior,
+  playlistLimit: normalizePlaylistLimitValue(storyCard.playlistLimit ?? defaultStoryRules.playlistLimit),
+  favoritesNeverRotate: storyCard.favoritesNeverRotate !== false,
+});
+
+const getEditorStoryRules = () => {
+  const selectedBehavior = newStoryBehaviorButtons.find((button) =>
+    button.classList.contains("is-selected")
+  );
+
+  return {
+    newStoryBehavior: selectedBehavior?.dataset.newStoryBehavior || defaultStoryRules.newStoryBehavior,
+    playlistLimit: defaultStoryRules.playlistLimit,
+    favoritesNeverRotate: true,
+  };
+};
+
+const setStoryRules = (storyCard = {}) => {
+  const rules = getStoryRules(storyCard);
+
+  newStoryBehaviorButtons.forEach((button) => {
+    button.classList.toggle("is-selected", button.dataset.newStoryBehavior === rules.newStoryBehavior);
+  });
+};
+
+const setStoriesSubtab = (tabName = "queue") => {
+  storySubtabs.forEach((tab) => {
+    const isSelected = tab.dataset.storiesSubtab === tabName;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+  });
+
+  storySubpanels.forEach((panel) => {
+    panel.hidden = panel.dataset.storiesSubpanel !== tabName;
+  });
+};
+
+const getStorySortValue = (story) => {
+  const dateValue = story.publishedAt || story.firstSeenAt || "";
+  const date = new Date(dateValue);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+};
+
+const sortPreviewStories = (stories) =>
+  stories.slice().sort((first, second) => getStorySortValue(second) - getStorySortValue(first));
+
+const getPlaylistPreview = (rules, stories) => {
+  const sortedStories = sortPreviewStories(stories);
+  const onYotoCandidates = [];
+  const newStories = [];
+  const skippedStories = [];
+  const oldStoryCandidates = [];
+  const favorites = sortedStories.filter((story) => story.isPinned);
+
+  sortedStories.forEach((story) => {
+    const isSkipped = story.isSkipped || story.status === "skipped";
+    const isSelected = story.isSelected || story.status === "selected" || story.status === "synced";
+    const isDiscovered = story.status === "discovered";
+    const favoriteIncluded = Boolean(story.isPinned && rules.favoritesNeverRotate);
+
+    if (isSkipped && !favoriteIncluded) {
+      skippedStories.push(story);
+      return;
+    }
+
+    if (favoriteIncluded || isSelected || (rules.newStoryBehavior === "auto_pick" && isDiscovered)) {
+      onYotoCandidates.push(story);
+      return;
+    }
+
+    if (isDiscovered && rules.newStoryBehavior === "choose_first") {
+      newStories.push(story);
+      return;
+    }
+
+    if (story.status === "rotated_off") {
+      oldStoryCandidates.push(story);
+      return;
+    }
+
+    newStories.push(story);
+  });
+
+  const pinnedOnYoto = [];
+  const limitedCandidates = [];
+  onYotoCandidates.forEach((story) => {
+    if (story.isPinned && rules.favoritesNeverRotate) {
+      pinnedOnYoto.push(story);
+    } else {
+      limitedCandidates.push(story);
+    }
+  });
+
+  const limit = rules.playlistLimit === "all" ? limitedCandidates.length : rules.playlistLimit;
+  const onYotoSoon = [...pinnedOnYoto, ...limitedCandidates.slice(0, limit)];
+  const oldStoriesResting = [...limitedCandidates.slice(limit), ...oldStoryCandidates];
+
+  return { onYotoSoon, newStories, skippedStories, oldStoriesResting, favorites };
+};
+
 const getStoryQueueLastChecked = () => {
   const activeCard = storyCards.find((storyCard) => storyCard.id === storyQueueState.storyCardId);
   return activeCard?.lastStoryDiscoveryAt ? `Last checked ${formatDateTime(activeCard.lastStoryDiscoveryAt)}` : "";
+};
+
+const isStoryAudioUsable = (story) => /^https?:\/\//i.test(String(story?.audioUrl || ""));
+
+const isStoryReadyToBringHome = (story) =>
+  isStoryAudioUsable(story) &&
+  story.status !== "downloaded" &&
+  story.status !== "uploaded" &&
+  story.status !== "adding_to_playlist" &&
+  story.status !== "synced";
+
+const setStoryDownloadState = (nextState) => {
+  storyDownloadState = { ...storyDownloadState, ...nextState };
+  renderStoryQueue();
+};
+
+const getStoryDisplayStatus = (story, group = "new") => {
+  if (group === "old" || story.status === "rotated_off") return "Old story resting";
+  if (group === "on_yoto" && story.status === "discovered") return "Picked for Yoto";
+  if (story.status === "downloading") return "Getting story ready";
+  return storyStatusLabels[story.status] || story.statusLabel || "New story found";
+};
+
+const getStoryTrackerStatus = (story, group = "new") => {
+  if (group === "on_yoto" && story.status === "discovered") return "selected";
+  return story.status;
+};
+
+const renderStoryTracker = (story, group = "new") => {
+  if (group === "old" || story.status === "skipped" || story.status === "rotated_off") return "";
+
+  const trackerStatus = getStoryTrackerStatus(story, group);
+  const statusIndex = {
+    discovered: 0,
+    selected: 1,
+    downloading: 2,
+    downloaded: 3,
+    failed: 2,
+    uploaded: 4,
+    adding_to_playlist: 5,
+    synced: 6,
+  }[trackerStatus] ?? 0;
+
+  return `
+    <div class="story-tracker" aria-label="Story Tracker">
+      <p>Story Tracker</p>
+      <ol>
+        ${storyTrackerSteps
+          .map((step, index) => {
+            const state = index < statusIndex ? "is-done" : index === statusIndex ? "is-active" : "";
+            return `<li class="story-tracker-step ${state}"><span></span>${escapeHtml(step.label)}</li>`;
+          })
+          .join("")}
+      </ol>
+    </div>
+  `;
+};
+
+const renderBringStoriesHomePanel = (preview) => {
+  const onYotoStories = preview.onYotoSoon || [];
+  const storiesToBringHome = onYotoStories.filter(isStoryReadyToBringHome);
+  const hasOnYotoStories = onYotoStories.length > 0;
+  const busy = storyDownloadState.bulk;
+  const helper = hasOnYotoStories
+    ? storiesToBringHome.length
+      ? `${storiesToBringHome.length} ${storiesToBringHome.length === 1 ? "story is" : "stories are"} ready for the next step.`
+      : "Stories picked for Yoto are already ready or waiting for the next step."
+    : "Pick a story first, then Feed Your Yoto can get it ready.";
+
+  return `
+    <div class="story-download-panel">
+      <p>${escapeHtml(helper)}</p>
+      <button class="outline-action" type="button" data-download-selected ${!storiesToBringHome.length || busy ? "disabled" : ""}>
+        ${busy ? "Getting stories ready..." : "Get Stories Ready"}
+      </button>
+    </div>
+  `;
 };
 
 const renderStoryQueue = () => {
@@ -720,10 +936,14 @@ const renderStoryQueue = () => {
 
   const lastChecked = getStoryQueueLastChecked();
   const lastCheckedMarkup = lastChecked ? `<p class="story-queue-last">${escapeHtml(lastChecked)}</p>` : "";
+  const queueMessageMarkup = storyQueueState.message
+    ? `<p class="story-queue-note">${escapeHtml(storyQueueState.message)}</p>`
+    : "";
 
   if (!storyQueueState.stories.length) {
     storyQueueContent.innerHTML = `
       ${lastCheckedMarkup}
+      ${queueMessageMarkup}
       <div class="story-queue-empty">
         <p>No stories found yet.</p>
       </div>
@@ -735,18 +955,98 @@ const renderStoryQueue = () => {
   const pendingMarkup = pendingCount
     ? `<p class="story-queue-unsaved">${pendingCount} Story Queue change${pendingCount === 1 ? "" : "s"} ready to save.</p>`
     : "";
+  const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
+  const hasPreviewStories = [
+    preview.onYotoSoon,
+    preview.newStories,
+    preview.favorites,
+    preview.skippedStories,
+    preview.oldStoriesResting,
+  ].some((group) => group.length > 0);
 
   storyQueueContent.innerHTML = `
     ${lastCheckedMarkup}
+    ${queueMessageMarkup}
     ${pendingMarkup}
-    <div class="story-list">
-      ${storyQueueState.stories.map(renderQueuedStory).join("")}
-    </div>
+    ${renderBringStoriesHomePanel(preview)}
+    ${hasPreviewStories ? renderPlaylistPreviewGroups(preview) : `<div class="story-queue-empty"><p>No stories found yet.</p></div>`}
   `;
 };
 
-const renderQueuedStory = (story) => {
+const renderPlaylistPreviewGroups = (preview) => `
+  <div class="playlist-preview-groups">
+    ${renderPreviewGroup("On Yoto Soon", "on_yoto", preview.onYotoSoon)}
+    ${renderPreviewGroup("New Stories", "new", preview.newStories)}
+    ${renderPreviewGroup("Favorites", "favorites", preview.favorites)}
+    ${renderPreviewGroup("Skipped Stories", "skipped", preview.skippedStories)}
+    ${renderPreviewGroup("Old Stories Resting", "old", preview.oldStoriesResting)}
+  </div>
+`;
+
+const renderPreviewGroup = (title, group, stories) => `
+  <section class="preview-group" aria-label="${escapeAttribute(title)}">
+    <div class="preview-group-heading">
+      <h5>${escapeHtml(title)}</h5>
+      <span>${stories.length}</span>
+    </div>
+    ${
+      stories.length
+        ? `<div class="story-list">${stories.map((story) => renderQueuedStory(story, group)).join("")}</div>`
+        : `<p class="preview-group-empty">No stories here yet.</p>`
+    }
+  </section>
+`;
+
+const getStoryControlsForGroup = (story, group) => {
+  if (group === "new") {
+    return getEditorStoryRules().newStoryBehavior === "choose_first"
+      ? [{ action: "select", label: "Pick for Yoto", active: story.isSelected }]
+      : [];
+  }
+
+  if (group === "on_yoto") {
+    return story.isPinned
+      ? [{ action: "pin", label: "Remove Favorite", active: true }]
+      : [
+          { action: "remove", label: "Remove from Card", active: false },
+          { action: "pin", label: "Keep Favorite", active: false },
+        ];
+  }
+
+  if (group === "favorites") {
+    return [];
+  }
+
+  return [{ action: "add_back", label: "Add Back to Playlist", active: false }];
+};
+
+const renderStoryDownloadAction = (story, group) => {
+  const canShowButton = group === "on_yoto" || story.isSelected || story.status === "selected" || story.status === "failed";
+  const isBusy = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
+
+  if (!canShowButton) return "";
+
+  if (!isStoryAudioUsable(story)) {
+    return `<p class="story-audio-note">This story does not have an audio file Feed Your Yoto can use.</p>`;
+  }
+
+  if (!isStoryReadyToBringHome(story)) return "";
+
+  return `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Get Story Ready"}</button>`;
+};
+
+const renderQueuedStory = (story, group = "new") => {
   const publishedAt = story.publishedAt ? formatDateTime(story.publishedAt) : "No date yet";
+  const controls = getStoryControlsForGroup(story, group);
+  const downloadAction = renderStoryDownloadAction(story, group);
+  const displayStatus = getStoryDisplayStatus(story, group);
+  const controlMarkup = controls
+    .map(
+      (control) =>
+        `<button class="${control.action === "select" ? "outline-action" : "quiet-action"} ${control.active ? "is-active" : ""}" type="button" data-story-action="${escapeAttribute(control.action)}">${escapeHtml(control.label)}</button>`
+    )
+    .join("");
+
   return `
     <article class="story-item" data-story-id="${escapeAttribute(story.id)}">
       <div class="story-item-copy">
@@ -755,13 +1055,11 @@ const renderQueuedStory = (story) => {
           ${story.isPinned ? `<span class="favorite-badge">Favorite</span>` : ""}
         </div>
         <p>${escapeHtml(publishedAt)}</p>
-        <span class="story-status">${escapeHtml(story.statusLabel || "New story found")}</span>
+        <span class="story-status ${story.status === "failed" ? "is-error" : ""}">${escapeHtml(displayStatus)}</span>
+        ${story.downloadError ? `<p class="story-error">${escapeHtml(story.downloadError)}</p>` : ""}
+        ${renderStoryTracker(story, group)}
       </div>
-      <div class="story-controls">
-        <button class="outline-action ${story.isSelected ? "is-active" : ""}" type="button" data-story-action="select">Pick for Yoto</button>
-        <button class="quiet-action ${story.isSkipped ? "is-active" : ""}" type="button" data-story-action="skip">Skip for now</button>
-        <button class="quiet-action ${story.isPinned ? "is-active" : ""}" type="button" data-story-action="pin">Keep Favorite</button>
-      </div>
+      ${controlMarkup || downloadAction ? `<div class="story-controls">${controlMarkup}${downloadAction}</div>` : ""}
     </article>
   `;
 };
@@ -826,12 +1124,21 @@ const discoverStories = async (storyCardId = activeCardId) => {
   }
 };
 
-const getStoryActionPayload = (story, action) =>
-  action === "select"
-    ? { isSelected: true, isSkipped: false, status: "selected" }
-    : action === "skip"
-      ? { isSkipped: true, isSelected: false, status: "skipped" }
-      : { isPinned: !story.isPinned };
+const getStoryActionPayload = (story, action) => {
+  if (action === "select" || action === "add_back") {
+    return { isSelected: true, isSkipped: false, status: "selected" };
+  }
+
+  if (action === "skip") {
+    return { isSkipped: true, isSelected: false, status: "skipped" };
+  }
+
+  if (action === "remove") {
+    return { isSelected: false, status: story.isPinned ? "discovered" : "rotated_off" };
+  }
+
+  return { isPinned: !story.isPinned };
+};
 
 const applyStoryQueuePatch = (story, patch) => {
   const nextStory = { ...story, ...patch };
@@ -887,6 +1194,81 @@ const savePendingStoryQueueChanges = async (storyCardId) => {
     stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
     pendingUpdates: {},
   });
+};
+
+const mergeStoryQueueUpdates = (updatedStories) => {
+  const updates = Array.isArray(updatedStories) ? updatedStories : [updatedStories];
+  const updatedById = new Map(updates.filter(Boolean).map((story) => [story.id, story]));
+
+  setStoryQueueState({
+    status: "loaded",
+    message: "",
+    stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
+  });
+};
+
+const downloadQueuedStory = async (storyId) => {
+  if (!activeCardId || !storyId) return;
+
+  const nextStoryIds = new Set(storyDownloadState.storyIds);
+  nextStoryIds.add(storyId);
+  setStoryDownloadState({ storyIds: nextStoryIds });
+
+  try {
+    await savePendingStoryQueueChanges(activeCardId);
+    const updatedStory = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(activeCardId)}/stories/${encodeURIComponent(storyId)}/download`,
+      "POST"
+    );
+    mergeStoryQueueUpdates(updatedStory);
+  } catch (error) {
+    setStoryQueueState({
+      status: "loaded",
+      message: error.message || "Feed Your Yoto could not get this story ready.",
+    });
+  } finally {
+    const remainingStoryIds = new Set(storyDownloadState.storyIds);
+    remainingStoryIds.delete(storyId);
+    setStoryDownloadState({ storyIds: remainingStoryIds });
+  }
+};
+
+const downloadSelectedStories = async () => {
+  if (!activeCardId) return;
+
+  const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
+  const storiesToBringHome = (preview.onYotoSoon || []).filter(isStoryReadyToBringHome);
+
+  if (!storiesToBringHome.length) {
+    setStoryQueueState({
+      status: "loaded",
+      message: "Pick a story first, then Feed Your Yoto can get it ready.",
+    });
+    return;
+  }
+
+  setStoryDownloadState({ bulk: true });
+
+  try {
+    await savePendingStoryQueueChanges(activeCardId);
+    const result = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(activeCardId)}/stories/download-selected`,
+      "POST"
+    );
+    setStoryQueueState({
+      status: "loaded",
+      message: result.failed?.length ? "Some stories need help before they can get ready." : "",
+      stories: Array.isArray(result.stories) ? result.stories : storyQueueState.stories,
+      pendingUpdates: {},
+    });
+  } catch (error) {
+    setStoryQueueState({
+      status: "loaded",
+      message: error.message || "Feed Your Yoto could not get these stories ready.",
+    });
+  } finally {
+    setStoryDownloadState({ bulk: false });
+  }
 };
 
 const isSetupChangeAcknowledged = () => Boolean(setupChangeAcknowledged?.checked);
@@ -990,7 +1372,9 @@ const openEditor = (storyCard) => {
   setFrequency(storyCard.updateRhythm);
   setLateFrequency(storyCard.lateCheckRhythm);
   setSwitch(storyCard.statusType === "live" || storyCard.statusType === "error");
+  setStoryRules(storyCard);
   setEditorTab("stories");
+  setStoriesSubtab("queue");
   setStoryQueueState({
     storyCardId: storyCard.id,
     status: "loading",
@@ -1051,6 +1435,7 @@ const saveActiveCard = async () => {
   const updateRhythm = selectedFrequency?.dataset.frequency || activeCard.updateRhythm;
   const previousText = setButtonBusy(saveCard, true, "Saving...");
 
+  const storyRules = getEditorStoryRules();
   const updatePayload = {
     updateRhythm,
     lateCheckRhythm:
@@ -1060,6 +1445,9 @@ const saveActiveCard = async () => {
     status: syncSwitch.classList.contains("is-on") ? "Updating" : "Taking a Break",
     statusType: syncSwitch.classList.contains("is-on") ? "live" : "paused",
     nextCheck: updateRhythm === "manual" ? "" : nextCrawl.value,
+    newStoryBehavior: storyRules.newStoryBehavior,
+    playlistLimit: storyRules.playlistLimit,
+    favoritesNeverRotate: storyRules.favoritesNeverRotate,
   };
 
   if (canEditSetupDetails()) {
@@ -1096,6 +1484,8 @@ const saveActiveCard = async () => {
       playlistName.value = refreshedCard.name;
       rssFeed.value = refreshedCard.podcastLink;
       populateEditorPlaylistOptions(refreshedCard);
+      setStoryRules(refreshedCard);
+      renderStoryQueue();
     }
   } catch (error) {
     dialogCrawl.textContent = error.message || "Could not save this Story Card.";
@@ -1728,12 +2118,42 @@ editorTabs.forEach((tab) => {
   });
 });
 
+storySubtabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    setStoriesSubtab(tab.dataset.storiesSubtab);
+  });
+});
+
+newStoryBehaviorButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    newStoryBehaviorButtons.forEach((option) => {
+      option.classList.toggle("is-selected", option === button);
+    });
+    renderStoryQueue();
+  });
+});
+
 refreshStories.addEventListener("click", () => {
   if (!requireAuth("Connect Yoto to refresh stories.")) return;
   discoverStories(activeCardId);
 });
 
 storyQueueContent.addEventListener("click", (event) => {
+  const bulkDownloadButton = event.target.closest("[data-download-selected]");
+  if (bulkDownloadButton) {
+    if (!requireAuth("Connect Yoto to get stories ready.")) return;
+    downloadSelectedStories();
+    return;
+  }
+
+  const downloadButton = event.target.closest("[data-download-story]");
+  if (downloadButton) {
+    if (!requireAuth("Connect Yoto to get this story ready.")) return;
+    const storyItem = downloadButton.closest("[data-story-id]");
+    downloadQueuedStory(storyItem?.dataset.storyId || "");
+    return;
+  }
+
   const actionButton = event.target.closest("[data-story-action]");
   if (!actionButton) return;
   if (!requireAuth("Connect Yoto to update the Story Queue.")) return;

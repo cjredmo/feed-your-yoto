@@ -140,7 +140,12 @@
           </div>
 
           <div id="storiesPanel" class="editor-panel" role="tabpanel" aria-labelledby="storiesTab" data-editor-panel="stories">
-            <section class="story-queue-panel" aria-labelledby="storyQueueTitle">
+            <div class="story-subtabs" role="tablist" aria-label="Story Queue options">
+              <button id="storyQueueSubtab" class="story-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="storyQueuePanel" data-stories-subtab="queue">Story Queue</button>
+              <button id="advancedOptionsSubtab" class="story-subtab" type="button" role="tab" aria-selected="false" aria-controls="advancedOptionsPanel" data-stories-subtab="advanced">Advanced Options</button>
+            </div>
+
+            <section id="storyQueuePanel" class="story-queue-panel" role="tabpanel" aria-labelledby="storyQueueSubtab" data-stories-subpanel="queue">
               <div class="story-queue-heading">
                 <div>
                   <p class="section-kicker">Story Queue</p>
@@ -152,8 +157,32 @@
                   <span>Checks the podcast for new stories.</span>
                 </div>
               </div>
-              <div id="storyQueueContent" class="story-queue-content" aria-live="polite">
-                <p class="story-queue-message">Looking for stories...</p>
+
+              <section class="playlist-preview-panel" aria-labelledby="playlistPreviewTitle">
+                <div>
+                  <p class="section-kicker">Playlist Preview</p>
+                  <h4 id="playlistPreviewTitle">Playlist Preview</h4>
+                  <p>These are the stories Feed Your Yoto will put on this Story Playlist once syncing is turned on.</p>
+                </div>
+                <div id="storyQueueContent" class="story-queue-content" aria-live="polite">
+                  <p class="story-queue-message">Looking for stories...</p>
+                </div>
+              </section>
+            </section>
+
+            <section id="advancedOptionsPanel" class="story-rules-panel" role="tabpanel" aria-labelledby="advancedOptionsSubtab" data-stories-subpanel="advanced" hidden>
+              <div>
+                <p class="section-kicker">Advanced Options</p>
+                <h4 id="storyRulesTitle">Advanced Options</h4>
+                <p>Choose how new stories join the Story Playlist.</p>
+              </div>
+
+              <div class="story-rule-group" aria-labelledby="newStoriesRuleLabel">
+                <p id="newStoriesRuleLabel">New stories</p>
+                <div class="segmented-control compact-segments">
+                  <button class="segment is-selected" type="button" data-new-story-behavior="auto_pick">Pick Automatically</button>
+                  <button class="segment" type="button" data-new-story-behavior="choose_first">Manual Picking</button>
+                </div>
               </div>
             </section>
           </div>
