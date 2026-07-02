@@ -12,6 +12,22 @@ let yotoCardsLoadState = {
 };
 
 let storyCards = [];
+let storyQueueState = {
+  storyCardId: "",
+  status: "idle",
+  message: "",
+  stories: [],
+  pendingUpdates: {},
+};
+
+const storyStatusLabels = {
+  discovered: "New story found",
+  selected: "Picked for Yoto",
+  skipped: "Skipped for now",
+  synced: "Ready on Yoto",
+  rotated_off: "Old story resting",
+  failed: "Needs help",
+};
 
 const updateRhythmOptions = [
   { value: "daily", label: "Every day" },
@@ -77,8 +93,12 @@ const confirmDeleteCard = document.querySelector("#confirmDeleteCard");
 const pauseCard = document.querySelector("#pauseCard");
 const syncSwitch = document.querySelector("#syncSwitch");
 const switchStatus = document.querySelector("#switchStatus");
+const refreshStories = document.querySelector("#refreshStories");
+const storyQueueContent = document.querySelector("#storyQueueContent");
 const frequencyButtons = Array.from(document.querySelectorAll("[data-frequency]"));
 const lateFrequencyButtons = Array.from(document.querySelectorAll("[data-late-frequency]"));
+const editorTabs = Array.from(document.querySelectorAll("[data-editor-tab]"));
+const editorPanels = Array.from(document.querySelectorAll("[data-editor-panel]"));
 
 let activeCardId = "";
 let isAuthenticated = false;
@@ -160,11 +180,17 @@ const setButtonBusy = (button, busy, busyText) => {
   return previousText;
 };
 
+const refreshStoryCardCache = async () => {
+  const savedStoryCards = await apiRequest("/api/story-cards");
+  storyCards = Array.isArray(savedStoryCards) ? savedStoryCards : [];
+};
+
 const loadStoryCards = async () => {
   try {
-    const savedStoryCards = await apiRequest("/api/story-cards");
-    storyCards = Array.isArray(savedStoryCards) ? savedStoryCards : [];
-    activeCardId = storyCards[0]?.id || "";
+    await refreshStoryCardCache();
+    if (!storyCards.some((storyCard) => storyCard.id === activeCardId)) {
+      activeCardId = storyCards[0]?.id || "";
+    }
   } catch (error) {
     console.warn("Could not load Story Cards.", error);
     storyCards = [];
@@ -652,6 +678,217 @@ const setSwitch = (isOn) => {
   switchStatus.textContent = isOn ? "On and watching" : "Off for now";
 };
 
+const setEditorTab = (tabName = "stories") => {
+  editorTabs.forEach((tab) => {
+    const isSelected = tab.dataset.editorTab === tabName;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+  });
+
+  editorPanels.forEach((panel) => {
+    panel.hidden = panel.dataset.editorPanel !== tabName;
+  });
+};
+
+const getStoryQueueLastChecked = () => {
+  const activeCard = storyCards.find((storyCard) => storyCard.id === storyQueueState.storyCardId);
+  return activeCard?.lastStoryDiscoveryAt ? `Last checked ${formatDateTime(activeCard.lastStoryDiscoveryAt)}` : "";
+};
+
+const renderStoryQueue = () => {
+  if (!storyQueueContent) return;
+
+  if (refreshStories) {
+    refreshStories.disabled = storyQueueState.status === "loading";
+    refreshStories.textContent = storyQueueState.status === "loading" ? "Looking..." : "Refresh Stories";
+  }
+
+  if (storyQueueState.status === "loading") {
+    storyQueueContent.innerHTML = `<p class="story-queue-message" role="status">Looking for stories...</p>`;
+    return;
+  }
+
+  if (storyQueueState.status === "error") {
+    storyQueueContent.innerHTML = `
+      <div class="story-queue-empty" role="alert">
+        <p>${escapeHtml(storyQueueState.message || "Could not look for stories.")}</p>
+      </div>
+    `;
+    return;
+  }
+
+  const lastChecked = getStoryQueueLastChecked();
+  const lastCheckedMarkup = lastChecked ? `<p class="story-queue-last">${escapeHtml(lastChecked)}</p>` : "";
+
+  if (!storyQueueState.stories.length) {
+    storyQueueContent.innerHTML = `
+      ${lastCheckedMarkup}
+      <div class="story-queue-empty">
+        <p>No stories found yet.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const pendingCount = Object.keys(storyQueueState.pendingUpdates || {}).length;
+  const pendingMarkup = pendingCount
+    ? `<p class="story-queue-unsaved">${pendingCount} Story Queue change${pendingCount === 1 ? "" : "s"} ready to save.</p>`
+    : "";
+
+  storyQueueContent.innerHTML = `
+    ${lastCheckedMarkup}
+    ${pendingMarkup}
+    <div class="story-list">
+      ${storyQueueState.stories.map(renderQueuedStory).join("")}
+    </div>
+  `;
+};
+
+const renderQueuedStory = (story) => {
+  const publishedAt = story.publishedAt ? formatDateTime(story.publishedAt) : "No date yet";
+  return `
+    <article class="story-item" data-story-id="${escapeAttribute(story.id)}">
+      <div class="story-item-copy">
+        <div class="story-item-title-row">
+          <h4>${escapeHtml(story.title || "Untitled story")}</h4>
+          ${story.isPinned ? `<span class="favorite-badge">Favorite</span>` : ""}
+        </div>
+        <p>${escapeHtml(publishedAt)}</p>
+        <span class="story-status">${escapeHtml(story.statusLabel || "New story found")}</span>
+      </div>
+      <div class="story-controls">
+        <button class="outline-action ${story.isSelected ? "is-active" : ""}" type="button" data-story-action="select">Pick for Yoto</button>
+        <button class="quiet-action ${story.isSkipped ? "is-active" : ""}" type="button" data-story-action="skip">Skip for now</button>
+        <button class="quiet-action ${story.isPinned ? "is-active" : ""}" type="button" data-story-action="pin">Keep Favorite</button>
+      </div>
+    </article>
+  `;
+};
+
+const setStoryQueueState = (nextState) => {
+  storyQueueState = { ...storyQueueState, ...nextState };
+  renderStoryQueue();
+};
+
+const loadStoryQueue = async (storyCardId, { discoverIfEmpty = false } = {}) => {
+  setStoryQueueState({
+    storyCardId,
+    status: "loading",
+    message: "",
+    stories: storyQueueState.storyCardId === storyCardId ? storyQueueState.stories : [],
+    pendingUpdates: {},
+  });
+
+  try {
+    const stories = await apiRequest(`/api/story-cards/${encodeURIComponent(storyCardId)}/stories`);
+    const queueStories = Array.isArray(stories) ? stories : [];
+
+    if (discoverIfEmpty && queueStories.length === 0) {
+      await discoverStories(storyCardId);
+      return;
+    }
+
+    setStoryQueueState({ status: "loaded", stories: queueStories, message: "", pendingUpdates: {} });
+  } catch (error) {
+    setStoryQueueState({
+      status: "error",
+      message: error.message || "Could not load the Story Queue.",
+      stories: [],
+      pendingUpdates: {},
+    });
+  }
+};
+
+const discoverStories = async (storyCardId = activeCardId) => {
+  if (!storyCardId) return;
+
+  setStoryQueueState({ storyCardId, status: "loading", message: "", pendingUpdates: {} });
+
+  try {
+    const stories = await apiRequest(
+      `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/discover`,
+      { method: "POST" }
+    );
+    await refreshStoryCardCache();
+    renderCards();
+    setStoryQueueState({
+      status: "loaded",
+      stories: Array.isArray(stories) ? stories : [],
+      message: "",
+      pendingUpdates: {},
+    });
+  } catch (error) {
+    setStoryQueueState({
+      status: "error",
+      message: error.message || "Could not look for stories.",
+    });
+  }
+};
+
+const getStoryActionPayload = (story, action) =>
+  action === "select"
+    ? { isSelected: true, isSkipped: false, status: "selected" }
+    : action === "skip"
+      ? { isSkipped: true, isSelected: false, status: "skipped" }
+      : { isPinned: !story.isPinned };
+
+const applyStoryQueuePatch = (story, patch) => {
+  const nextStory = { ...story, ...patch };
+  if (patch.status) {
+    nextStory.statusLabel = storyStatusLabels[patch.status] || story.statusLabel;
+  }
+  return nextStory;
+};
+
+const updateQueuedStoryControl = (storyId, action) => {
+  if (!activeCardId || !storyId) return;
+
+  const story = storyQueueState.stories.find((item) => item.id === storyId);
+  if (!story) return;
+
+  const payload = getStoryActionPayload(story, action);
+  const nextPendingUpdates = {
+    ...(storyQueueState.pendingUpdates || {}),
+    [storyId]: {
+      ...(storyQueueState.pendingUpdates?.[storyId] || {}),
+      ...payload,
+    },
+  };
+
+  setStoryQueueState({
+    status: "loaded",
+    message: "",
+    stories: storyQueueState.stories.map((item) =>
+      item.id === storyId ? applyStoryQueuePatch(item, payload) : item
+    ),
+    pendingUpdates: nextPendingUpdates,
+  });
+};
+
+const savePendingStoryQueueChanges = async (storyCardId) => {
+  const pendingEntries = Object.entries(storyQueueState.pendingUpdates || {});
+  if (!pendingEntries.length) return;
+
+  const updatedStories = await Promise.all(
+    pendingEntries.map(([storyId, payload]) =>
+      jsonRequest(
+        `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/${encodeURIComponent(storyId)}`,
+        "PUT",
+        payload
+      )
+    )
+  );
+
+  const updatedById = new Map(updatedStories.map((story) => [story.id, story]));
+  setStoryQueueState({
+    status: "loaded",
+    message: "",
+    stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
+    pendingUpdates: {},
+  });
+};
+
 const isSetupChangeAcknowledged = () => Boolean(setupChangeAcknowledged?.checked);
 
 const isPodcastChangeConfirmed = () =>
@@ -753,10 +990,19 @@ const openEditor = (storyCard) => {
   setFrequency(storyCard.updateRhythm);
   setLateFrequency(storyCard.lateCheckRhythm);
   setSwitch(storyCard.statusType === "live" || storyCard.statusType === "error");
+  setEditorTab("stories");
+  setStoryQueueState({
+    storyCardId: storyCard.id,
+    status: "loading",
+    message: "",
+    stories: [],
+    pendingUpdates: {},
+  });
 
   backdrop.hidden = false;
   setModalLock();
-  window.setTimeout(() => playlistName.focus(), 0);
+  loadStoryQueue(storyCard.id, { discoverIfEmpty: true });
+  window.setTimeout(() => editorTabs.find((tab) => tab.dataset.editorTab === "stories")?.focus(), 0);
 };
 
 const closeEditor = () => {
@@ -833,9 +1079,24 @@ const saveActiveCard = async () => {
   }
 
   try {
-    await jsonRequest(`/api/story-cards/${encodeURIComponent(activeCard.id)}`, "PUT", updatePayload);
+    const savedStoryCard = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(activeCard.id)}`,
+      "PUT",
+      updatePayload
+    );
+    await savePendingStoryQueueChanges(activeCard.id);
     await loadStoryCards();
-    closeEditor();
+    const refreshedCard = storyCards.find((storyCard) => storyCard.id === activeCard.id) || savedStoryCard;
+    if (refreshedCard) {
+      dialogArt.innerHTML = getStoryCardArtMarkup(refreshedCard);
+      dialogTitle.textContent = refreshedCard.name;
+      dialogStatus.className = `status-pill status-${refreshedCard.statusType}`;
+      dialogStatus.textContent = refreshedCard.status;
+      dialogCrawl.textContent = `Next Check: ${getStoryCardNextCheckLabel(refreshedCard)}`;
+      playlistName.value = refreshedCard.name;
+      rssFeed.value = refreshedCard.podcastLink;
+      populateEditorPlaylistOptions(refreshedCard);
+    }
   } catch (error) {
     dialogCrawl.textContent = error.message || "Could not save this Story Card.";
   } finally {
@@ -1459,6 +1720,26 @@ lateFrequencyButtons.forEach((button) => {
     if (!requireAuth("Connect Yoto to change update settings.")) return;
     setLateFrequency(button.dataset.lateFrequency);
   });
+});
+
+editorTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    setEditorTab(tab.dataset.editorTab);
+  });
+});
+
+refreshStories.addEventListener("click", () => {
+  if (!requireAuth("Connect Yoto to refresh stories.")) return;
+  discoverStories(activeCardId);
+});
+
+storyQueueContent.addEventListener("click", (event) => {
+  const actionButton = event.target.closest("[data-story-action]");
+  if (!actionButton) return;
+  if (!requireAuth("Connect Yoto to update the Story Queue.")) return;
+
+  const storyItem = actionButton.closest("[data-story-id]");
+  updateQueuedStoryControl(storyItem?.dataset.storyId || "", actionButton.dataset.storyAction);
 });
 
 syncSwitch.addEventListener("click", () => {

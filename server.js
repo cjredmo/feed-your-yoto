@@ -1,6 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const PORT = Number(process.env.PORT || 4173);
 const PUBLIC_DIR = __dirname;
@@ -44,6 +45,7 @@ const getDataDir = async () => {
 const getTokenPath = async () => path.join(await getDataDir(), "yoto_tokens.json");
 const getPendingPath = async () => path.join(await getDataDir(), "pending_device_auth.json");
 const getStoryCardsPath = async () => path.join(await getDataDir(), "story_cards.json");
+const getStoryQueuePath = async () => path.join(await getDataDir(), "story_queue.json");
 
 const sendJson = (response, statusCode, body) => {
   response.writeHead(statusCode, {
@@ -118,6 +120,26 @@ const readStoryCards = async () => {
 const writeStoryCards = async (storyCards) => {
   await writeJsonFile(await getStoryCardsPath(), storyCards);
 };
+
+const readStoryQueue = async () => {
+  const storyQueue = await readJsonFile(await getStoryQueuePath());
+  return Array.isArray(storyQueue) ? storyQueue : [];
+};
+
+const writeStoryQueue = async (storyQueue) => {
+  await writeJsonFile(await getStoryQueuePath(), storyQueue);
+};
+
+const storyStatusLabels = {
+  discovered: "New story found",
+  selected: "Picked for Yoto",
+  skipped: "Skipped for now",
+  synced: "Ready on Yoto",
+  rotated_off: "Old story resting",
+  failed: "Needs help",
+};
+
+const editableStoryStatuses = new Set(["discovered", "selected", "skipped", "rotated_off"]);
 
 const isHttpUrl = (value) => {
   try {
@@ -200,6 +222,15 @@ const getPodcastImageUrl = (channelXml) => {
   return isHttpUrl(itunesImage) ? itunesImage : isHttpUrl(imageUrl) ? imageUrl : null;
 };
 
+const getPodcastChannelXml = (xml) => {
+  const channelMatch = String(xml || "").match(/<channel\b[^>]*>([\s\S]*?)<\/channel>/i);
+  if (!channelMatch) {
+    throw createExposedError("We could not read that Podcast Link. Try a different link.");
+  }
+
+  return channelMatch[1];
+};
+
 const getEpisodeAudio = (itemXml) => {
   const audioUrl = getXmlTagAttribute(itemXml, "enclosure", "url");
   const audioType = getXmlTagAttribute(itemXml, "enclosure", "type");
@@ -209,20 +240,16 @@ const getEpisodeAudio = (itemXml) => {
   };
 };
 
-const parsePodcastFeed = (xml) => {
-  const channelMatch = String(xml || "").match(/<channel\b[^>]*>([\s\S]*?)<\/channel>/i);
-  if (!channelMatch) {
-    throw createExposedError("We could not read that Podcast Link. Try a different link.");
-  }
-
-  const channelXml = channelMatch[1];
-  const itemBlocks = extractXmlBlocks(channelXml, "item");
-  const episodes = itemBlocks.map((itemXml, index) => {
+const parsePodcastEpisodes = (channelXml) =>
+  extractXmlBlocks(channelXml, "item").map((itemXml, index) => {
     const publishedAt = normalizeIsoDate(getXmlTagText(itemXml, "pubDate"));
     const audio = getEpisodeAudio(itemXml);
     return {
       index,
-      title: getXmlTagText(itemXml, "title") || "Untitled episode",
+      title: getXmlTagText(itemXml, "title") || "Untitled story",
+      description:
+        getXmlTagText(itemXml, "description") ||
+        getXmlTagText(itemXml, "summary", { allowPrefix: true }),
       publishedAt,
       guid: getXmlTagText(itemXml, "guid"),
       audioUrl: audio.audioUrl,
@@ -230,14 +257,18 @@ const parsePodcastFeed = (xml) => {
     };
   });
 
-  const latestEpisode = episodes
-    .slice()
-    .sort((first, second) => {
-      if (!first.publishedAt && !second.publishedAt) return first.index - second.index;
-      if (!first.publishedAt) return 1;
-      if (!second.publishedAt) return -1;
-      return new Date(second.publishedAt).getTime() - new Date(first.publishedAt).getTime();
-    })[0] || null;
+const sortPodcastEpisodes = (episodes) =>
+  episodes.slice().sort((first, second) => {
+    if (!first.publishedAt && !second.publishedAt) return first.index - second.index;
+    if (!first.publishedAt) return 1;
+    if (!second.publishedAt) return -1;
+    return new Date(second.publishedAt).getTime() - new Date(first.publishedAt).getTime();
+  });
+
+const parsePodcastFeed = (xml) => {
+  const channelXml = getPodcastChannelXml(xml);
+  const episodes = parsePodcastEpisodes(channelXml);
+  const latestEpisode = sortPodcastEpisodes(episodes)[0] || null;
 
   const warnings = [];
   if (latestEpisode && !latestEpisode.audioUrl) {
@@ -263,6 +294,8 @@ const parsePodcastFeed = (xml) => {
     warnings,
   };
 };
+
+const parsePodcastStories = (xml) => sortPodcastEpisodes(parsePodcastEpisodes(getPodcastChannelXml(xml)));
 
 const fetchPodcastFeedXml = async (podcastLink, redirectCount = 0) => {
   if (redirectCount > PODCAST_FEED_MAX_REDIRECTS) {
@@ -413,6 +446,15 @@ const normalizeStoryCard = (body, existingCard = {}) => {
       ? body.latestEpisodeAudioUrl ?? existingCard.latestEpisodeAudioUrl
       : "",
     lastPreviewedAt: String(body.lastPreviewedAt ?? existingCard.lastPreviewedAt ?? "").trim(),
+    lastStoryDiscoveryAt: String(
+      body.lastStoryDiscoveryAt ?? existingCard.lastStoryDiscoveryAt ?? ""
+    ).trim(),
+    lastStoryDiscoveryStatus: String(
+      body.lastStoryDiscoveryStatus ?? existingCard.lastStoryDiscoveryStatus ?? ""
+    ).trim(),
+    lastStoryDiscoveryMessage: String(
+      body.lastStoryDiscoveryMessage ?? existingCard.lastStoryDiscoveryMessage ?? ""
+    ).trim(),
     yotoPlaylistId: String(body.yotoPlaylistId || "").trim(),
     yotoPlaylistTitle: String(body.yotoPlaylistTitle || "Story Playlist").trim(),
     yotoPlaylistImageUrl: isHttpUrl(body.yotoPlaylistImageUrl)
@@ -542,6 +584,170 @@ const deleteStoryCard = async (id) => {
 
   await writeStoryCards(nextStoryCards);
   return { deleted: true };
+};
+
+const getStoryCardOrThrow = async (storyCardId) => {
+  const storyCards = await readStoryCards();
+  const storyCard = storyCards.find((card) => card.id === storyCardId);
+
+  if (!storyCard) {
+    throw createExposedError("Story Card not found.", 404);
+  }
+
+  return { storyCards, storyCard };
+};
+
+const sortQueuedStories = (stories) =>
+  stories.slice().sort((first, second) => {
+    const firstDate = first.publishedAt || first.firstSeenAt || "";
+    const secondDate = second.publishedAt || second.firstSeenAt || "";
+
+    if (!firstDate && !secondDate) return String(first.title).localeCompare(String(second.title));
+    if (!firstDate) return 1;
+    if (!secondDate) return -1;
+
+    return new Date(secondDate).getTime() - new Date(firstDate).getTime();
+  });
+
+const getStoryQueueForStoryCard = async (storyCardId) => {
+  const storyQueue = await readStoryQueue();
+  return sortQueuedStories(storyQueue.filter((story) => story.storyCardId === storyCardId));
+};
+
+const getQueuedStoryKey = (storyCardId, story) => {
+  const keyValue = story.guid || story.audioUrl || `${story.title || "Untitled story"}:${story.publishedAt || ""}`;
+  return `${storyCardId}:${keyValue}`;
+};
+
+const createQueuedStoryId = (storyCardId, story) => {
+  const hash = crypto.createHash("sha1").update(getQueuedStoryKey(storyCardId, story)).digest("hex").slice(0, 16);
+  return `${storyCardId}-${hash}`;
+};
+
+const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
+  const now = new Date().toISOString();
+  const status = existingStory.status && existingStory.status !== "discovered" ? existingStory.status : "discovered";
+
+  return {
+    id: existingStory.id || createQueuedStoryId(storyCardId, story),
+    storyCardId,
+    title: String(story.title || existingStory.title || "Untitled story").trim(),
+    description: String(story.description ?? existingStory.description ?? "").trim(),
+    publishedAt: String(story.publishedAt ?? existingStory.publishedAt ?? "").trim(),
+    guid: String(story.guid ?? existingStory.guid ?? "").trim(),
+    audioUrl: isHttpUrl(story.audioUrl ?? existingStory.audioUrl)
+      ? story.audioUrl ?? existingStory.audioUrl
+      : "",
+    audioType: String(story.audioType ?? existingStory.audioType ?? "").trim(),
+    status,
+    statusLabel: storyStatusLabels[status] || storyStatusLabels.discovered,
+    isPinned: Boolean(existingStory.isPinned),
+    isSelected: Boolean(existingStory.isSelected),
+    isSkipped: Boolean(existingStory.isSkipped),
+    firstSeenAt: existingStory.firstSeenAt || now,
+    updatedAt: now,
+  };
+};
+
+const upsertQueuedStories = async (storyCardId, stories) => {
+  const storyQueue = await readStoryQueue();
+  const nextQueue = [...storyQueue];
+
+  stories.forEach((story) => {
+    const id = createQueuedStoryId(storyCardId, story);
+    const index = nextQueue.findIndex((queuedStory) => queuedStory.id === id);
+    const existingStory = index >= 0 ? nextQueue[index] : {};
+    const queuedStory = normalizeQueuedStory(storyCardId, story, existingStory);
+
+    if (index >= 0) {
+      nextQueue[index] = queuedStory;
+    } else {
+      nextQueue.push(queuedStory);
+    }
+  });
+
+  await writeStoryQueue(nextQueue);
+  return sortQueuedStories(nextQueue.filter((story) => story.storyCardId === storyCardId));
+};
+
+const updateStoryCardDiscovery = async (storyCardId, status, message) => {
+  const storyCards = await readStoryCards();
+  const index = storyCards.findIndex((card) => card.id === storyCardId);
+
+  if (index === -1) {
+    throw createExposedError("Story Card not found.", 404);
+  }
+
+  storyCards[index] = normalizeStoryCard(
+    {
+      ...storyCards[index],
+      lastStoryDiscoveryAt: new Date().toISOString(),
+      lastStoryDiscoveryStatus: status,
+      lastStoryDiscoveryMessage: message,
+    },
+    storyCards[index]
+  );
+  await writeStoryCards(storyCards);
+  return storyCards[index];
+};
+
+const discoverStoriesForStoryCard = async (storyCardId) => {
+  const { storyCard } = await getStoryCardOrThrow(storyCardId);
+
+  try {
+    const xml = await fetchPodcastFeedXml(validatePodcastLink(storyCard.podcastLink));
+    const stories = parsePodcastStories(xml);
+    const queuedStories = await upsertQueuedStories(storyCardId, stories);
+    await updateStoryCardDiscovery(
+      storyCardId,
+      "success",
+      stories.length ? `${stories.length} stories found.` : "No stories found yet."
+    );
+    return queuedStories;
+  } catch (error) {
+    await updateStoryCardDiscovery(
+      storyCardId,
+      "error",
+      error.expose ? error.message : "Could not look for stories."
+    );
+    throw error;
+  }
+};
+
+const updateQueuedStory = async (storyCardId, storyId, body) => {
+  await getStoryCardOrThrow(storyCardId);
+
+  const storyQueue = await readStoryQueue();
+  const index = storyQueue.findIndex(
+    (story) => story.storyCardId === storyCardId && story.id === storyId
+  );
+
+  if (index === -1) {
+    throw createExposedError("Story not found.", 404);
+  }
+
+  const nextStory = { ...storyQueue[index] };
+
+  ["isPinned", "isSelected", "isSkipped"].forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      nextStory[field] = Boolean(body[field]);
+    }
+  });
+
+  if (Object.prototype.hasOwnProperty.call(body, "status")) {
+    const status = String(body.status || "").trim();
+    if (!editableStoryStatuses.has(status)) {
+      throw createExposedError("That Story status cannot be changed here.");
+    }
+    nextStory.status = status;
+  }
+
+  nextStory.statusLabel = storyStatusLabels[nextStory.status] || storyStatusLabels.discovered;
+  nextStory.updatedAt = new Date().toISOString();
+  storyQueue[index] = nextStory;
+  await writeStoryQueue(storyQueue);
+
+  return nextStory;
 };
 
 const hasCurrentAccessToken = (tokens) => {
@@ -1025,6 +1231,9 @@ const resetAuth = async () => {
 
 const handleApi = async (request, response, pathname) => {
   try {
+    const storyQueueRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/?$/);
+    const storyDiscoverRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/discover\/?$/);
+    const storyQueueItemRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/?$/);
     const storyCardRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/?$/);
     const isStoryCardsRoute = pathname === "/api/story-cards" || pathname === "/api/story-cards/";
 
@@ -1055,6 +1264,26 @@ const handleApi = async (request, response, pathname) => {
 
     if (request.method === "POST" && pathname === "/api/podcast/preview") {
       sendJson(response, 200, await previewPodcast(await readRequestJson(request)));
+      return;
+    }
+
+    if (request.method === "GET" && storyQueueRoute) {
+      const storyCardId = decodeURIComponent(storyQueueRoute[1]);
+      await getStoryCardOrThrow(storyCardId);
+      sendJson(response, 200, await getStoryQueueForStoryCard(storyCardId));
+      return;
+    }
+
+    if (request.method === "POST" && storyDiscoverRoute) {
+      const storyCardId = decodeURIComponent(storyDiscoverRoute[1]);
+      sendJson(response, 200, await discoverStoriesForStoryCard(storyCardId));
+      return;
+    }
+
+    if (request.method === "PUT" && storyQueueItemRoute) {
+      const storyCardId = decodeURIComponent(storyQueueItemRoute[1]);
+      const storyId = decodeURIComponent(storyQueueItemRoute[2]);
+      sendJson(response, 200, await updateQueuedStory(storyCardId, storyId, await readRequestJson(request)));
       return;
     }
 

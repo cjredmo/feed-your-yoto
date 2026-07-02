@@ -133,94 +133,131 @@
             </button>
           </div>
 
-          <div class="field-grid">
-            <label class="field">
-              <span>Story Card Name</span>
-              <input id="playlistName" type="text" value="Story Station" disabled />
-            </label>
+          <div class="editor-tabs" role="tablist" aria-label="Story Card sections">
+            <button id="storiesTab" class="editor-tab is-selected" type="button" role="tab" aria-selected="true" aria-controls="storiesPanel" data-editor-tab="stories">Stories</button>
+            <button id="scheduleTab" class="editor-tab" type="button" role="tab" aria-selected="false" aria-controls="schedulePanel" data-editor-tab="schedule">Schedule</button>
+            <button id="setupTab" class="editor-tab" type="button" role="tab" aria-selected="false" aria-controls="setupPanel" data-editor-tab="setup">Setup</button>
+          </div>
 
-            <label class="field">
-              <span>Podcast Link</span>
-              <input id="rssFeed" type="url" value="https://example.com/story-station.xml" disabled />
-              <small>Paste the podcast's RSS feed link here.</small>
-            </label>
+          <div id="storiesPanel" class="editor-panel" role="tabpanel" aria-labelledby="storiesTab" data-editor-panel="stories">
+            <section class="story-queue-panel" aria-labelledby="storyQueueTitle">
+              <div class="story-queue-heading">
+                <div>
+                  <p class="section-kicker">Story Queue</p>
+                  <h3 id="storyQueueTitle">Story Queue</h3>
+                  <p>Stories from this podcast will show up here.</p>
+                </div>
+                <div class="story-queue-actions">
+                  <button id="refreshStories" class="outline-action" type="button">Refresh Stories</button>
+                  <span>Checks the podcast for new stories.</span>
+                </div>
+              </div>
+              <div id="storyQueueContent" class="story-queue-content" aria-live="polite">
+                <p class="story-queue-message">Looking for stories...</p>
+              </div>
+            </section>
+          </div>
 
-            <label class="field">
-              <span>Story Playlist</span>
-              <select id="yotoCard" disabled>
-                <option>Choose a Story Playlist</option>
-              </select>
-            </label>
-
+          <div id="schedulePanel" class="editor-panel" role="tabpanel" aria-labelledby="scheduleTab" data-editor-panel="schedule" hidden>
             <label class="field">
               <span>Next Check</span>
               <input id="nextCrawl" type="datetime-local" value="2026-06-28T19:30" />
             </label>
-          </div>
 
-          <div class="setup-lock-row">
-            <button id="changeSetupDetails" class="outline-action" type="button">Change setup details</button>
-          </div>
-
-          <div id="setupDetailsPanel" class="setup-details-panel" hidden>
-            <div class="setup-warning" role="note">
-              <strong>Grown-up note</strong>
-              <span>Changing the Story Card name, Podcast Link, or Story Playlist can affect what Feed Your Yoto syncs. Only change these if you are fixing the setup.</span>
+            <div class="control-group" aria-labelledby="frequencyLabel">
+              <p id="frequencyLabel">Look for new episodes</p>
+              <div class="segmented-control">
+                <button class="segment is-selected" type="button" data-frequency="daily">Every day</button>
+                <button class="segment" type="button" data-frequency="weekly">Every week</button>
+                <button class="segment" type="button" data-frequency="monthly">Every month</button>
+                <button class="segment" type="button" data-frequency="manual">Only when I press check</button>
+              </div>
             </div>
-            <label class="setup-checkbox">
-              <input id="setupChangeAcknowledged" type="checkbox" />
-              <span>I understand this changes the setup for this Story Card.</span>
-            </label>
-            <label class="field setup-change-code">
-              <span>Type CHANGE to edit the Podcast Link</span>
-              <input id="podcastChangeCode" type="text" autocomplete="off" />
-            </label>
-          </div>
 
-          <div class="control-group" aria-labelledby="frequencyLabel">
-            <p id="frequencyLabel">Look for new episodes</p>
-            <div class="segmented-control">
-              <button class="segment is-selected" type="button" data-frequency="daily">Every day</button>
-              <button class="segment" type="button" data-frequency="weekly">Every week</button>
-              <button class="segment" type="button" data-frequency="monthly">Every month</button>
-              <button class="segment" type="button" data-frequency="manual">Only when I press check</button>
+            <div class="control-group" aria-labelledby="lateFrequencyLabel">
+              <p id="lateFrequencyLabel">If the new episode is late</p>
+              <div class="segmented-control late-check-control">
+                <button class="segment is-selected" type="button" data-late-frequency="hourly">Keep checking every hour</button>
+                <button class="segment" type="button" data-late-frequency="daily">Keep checking once a day</button>
+                <button class="segment" type="button" data-late-frequency="next">Wait until next time</button>
+              </div>
             </div>
-          </div>
 
-          <div class="control-group" aria-labelledby="lateFrequencyLabel">
-            <p id="lateFrequencyLabel">If the new episode is late</p>
-            <div class="segmented-control late-check-control">
-              <button class="segment is-selected" type="button" data-late-frequency="hourly">Keep checking every hour</button>
-              <button class="segment" type="button" data-late-frequency="daily">Keep checking once a day</button>
-              <button class="segment" type="button" data-late-frequency="next">Wait until next time</button>
+            <div class="switch-row">
+              <div>
+                <p>Keep Updated</p>
+                <span id="switchStatus">On and watching</span>
+              </div>
+              <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
+                <span></span>
+              </button>
+            </div>
+
+            <div class="dialog-actions schedule-panel-actions">
+              <span class="dialog-action-spacer" aria-hidden="true"></span>
+              <button id="pauseCard" class="quiet-action" type="button">Take a Break</button>
             </div>
           </div>
 
-          <div class="switch-row">
-            <div>
-              <p>Keep Updated</p>
-              <span id="switchStatus">On and watching</span>
+          <div id="setupPanel" class="editor-panel" role="tabpanel" aria-labelledby="setupTab" data-editor-panel="setup" hidden>
+            <div class="field-grid">
+              <label class="field">
+                <span>Story Card Name</span>
+                <input id="playlistName" type="text" value="Story Station" disabled />
+              </label>
+
+              <label class="field">
+                <span>Podcast Link</span>
+                <input id="rssFeed" type="url" value="https://example.com/story-station.xml" disabled />
+                <small>Paste the podcast's RSS feed link here.</small>
+              </label>
+
+              <label class="field">
+                <span>Story Playlist</span>
+                <select id="yotoCard" disabled>
+                  <option>Choose a Story Playlist</option>
+                </select>
+              </label>
             </div>
-            <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
-              <span></span>
-            </button>
+
+            <div class="setup-lock-row">
+              <button id="changeSetupDetails" class="outline-action" type="button">Change setup details</button>
+            </div>
+
+            <div id="setupDetailsPanel" class="setup-details-panel" hidden>
+              <div class="setup-warning" role="note">
+                <strong>Grown-up note</strong>
+                <span>Changing the Story Card name, Podcast Link, or Story Playlist can affect what Feed Your Yoto syncs. Only change these if you are fixing the setup.</span>
+              </div>
+              <label class="setup-checkbox">
+                <input id="setupChangeAcknowledged" type="checkbox" />
+                <span>I understand this changes the setup for this Story Card.</span>
+              </label>
+              <label class="field setup-change-code">
+                <span>Type CHANGE to edit the Podcast Link</span>
+                <input id="podcastChangeCode" type="text" autocomplete="off" />
+              </label>
+            </div>
+
+            <div id="deleteConfirmPanel" class="delete-confirmation" hidden>
+              <div>
+                <p>Remove this setup?</p>
+                <span>The Story Playlist stays safe. This podcast link will stop updating.</span>
+              </div>
+              <div class="delete-confirm-actions">
+                <button id="cancelDeleteCard" class="quiet-action" type="button">Keep It</button>
+                <button id="confirmDeleteCard" class="destructive-action" type="button">Remove Setup</button>
+              </div>
+            </div>
+
+            <div class="dialog-actions setup-panel-actions">
+              <span class="dialog-action-spacer" aria-hidden="true"></span>
+              <button id="deleteCard" class="danger-action" type="button">Remove Setup</button>
+            </div>
           </div>
 
-          <div id="deleteConfirmPanel" class="delete-confirmation" hidden>
-            <div>
-              <p>Remove this setup?</p>
-              <span>The Story Playlist stays safe. This podcast link will stop updating.</span>
-            </div>
-            <div class="delete-confirm-actions">
-              <button id="cancelDeleteCard" class="quiet-action" type="button">Keep It</button>
-              <button id="confirmDeleteCard" class="destructive-action" type="button">Remove Setup</button>
-            </div>
-          </div>
-
-          <div class="dialog-actions">
-            <button id="deleteCard" class="danger-action" type="button">Remove Setup</button>
+          <div class="dialog-actions editor-save-actions">
             <span class="dialog-action-spacer" aria-hidden="true"></span>
-            <button id="pauseCard" class="quiet-action" type="button">Take a Break</button>
             <button id="saveCard" class="primary-action" type="button">Save Story Card</button>
           </div>
         </form>
