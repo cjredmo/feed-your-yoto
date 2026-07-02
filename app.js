@@ -25,6 +25,8 @@ let storyDownloadState = {
   bulk: false,
   processing: false,
 };
+let activityLogEntries = [];
+let activeView = "story-cards";
 
 const storyStatusLabels = {
   discovered: "New story found",
@@ -70,6 +72,15 @@ const lateCheckRhythmOptions = [
 ];
 
 const cardGrid = document.querySelector("#cardGrid");
+const storyCardsNav = document.querySelector("#storyCardsNav");
+const activityLogNav = document.querySelector("#activityLogNav");
+const dashboardTitle = document.querySelector("#dashboardTitle");
+const dashboardSubtitle = document.querySelector("#dashboardSubtitle");
+const storyCardOverview = document.querySelector("#storyCardOverview");
+const storyCardSectionHeading = document.querySelector("#storyCardSectionHeading");
+const activityLogPanel = document.querySelector("#activityLogPanel");
+const activityLogList = document.querySelector("#activityLogList");
+const refreshActivityLog = document.querySelector("#refreshActivityLog");
 const backdrop = document.querySelector("#dialogBackdrop");
 const setupBackdrop = document.querySelector("#setupBackdrop");
 const setupTitle = document.querySelector("#setupTitle");
@@ -639,6 +650,79 @@ const updateMetrics = () => {
       : `${storyCards.length} story cards managed by this app.`;
 };
 
+const setActiveView = async (viewName) => {
+  activeView = viewName === "activity-log" ? "activity-log" : "story-cards";
+  const showingActivity = activeView === "activity-log";
+
+  storyCardsNav?.classList.toggle("is-active", !showingActivity);
+  activityLogNav?.classList.toggle("is-active", showingActivity);
+  if (dashboardTitle) dashboardTitle.textContent = showingActivity ? "Activity Log" : "My Story Cards";
+  if (dashboardSubtitle) {
+    dashboardSubtitle.textContent = showingActivity
+      ? "Recent story preparation updates and things that need help."
+      : "Podcast-powered Story Cards for Story Playlists.";
+  }
+  if (storyCardOverview) storyCardOverview.hidden = showingActivity;
+  if (storyCardSectionHeading) storyCardSectionHeading.hidden = showingActivity;
+  if (cardGrid) cardGrid.hidden = showingActivity;
+  if (activityLogPanel) activityLogPanel.hidden = !showingActivity;
+
+  if (showingActivity) await loadActivityLog();
+};
+
+const getActivityStoryCardName = (entry) =>
+  storyCards.find((storyCard) => storyCard.id === entry.storyCardId)?.name || "";
+
+const getActivityStoryTitle = (entry) => {
+  const visibleStory = storyQueueState.stories.find((story) => story.id === entry.storyId);
+  return visibleStory?.title || "";
+};
+
+const getActivityLevelLabel = (level) => (level === "error" ? "Needs help" : level === "warning" ? "Warning" : "Info");
+
+const renderActivityLog = () => {
+  if (!activityLogList) return;
+
+  if (!activityLogEntries.length) {
+    activityLogList.innerHTML = `<p class="activity-log-empty">No activity yet.</p>`;
+    return;
+  }
+
+  activityLogList.innerHTML = activityLogEntries
+    .map((entry) => {
+      const storyCardName = getActivityStoryCardName(entry);
+      const storyTitle = getActivityStoryTitle(entry);
+      return `
+        <article class="activity-log-item">
+          <div class="activity-log-meta">
+            <span class="activity-level activity-${escapeAttribute(entry.level || "info")}">${escapeHtml(getActivityLevelLabel(entry.level))}</span>
+            <time>${escapeHtml(entry.createdAt ? formatDateTime(entry.createdAt) : "")}</time>
+          </div>
+          <div class="activity-log-copy">
+            <h3>${escapeHtml(entry.title || "Feed Your Yoto update")}</h3>
+            ${entry.message ? `<p>${escapeHtml(entry.message)}</p>` : ""}
+            ${storyCardName || storyTitle ? `<span>${escapeHtml([storyCardName, storyTitle].filter(Boolean).join(" - "))}</span>` : ""}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+};
+
+const loadActivityLog = async () => {
+  if (!activityLogList) return;
+  activityLogList.innerHTML = `<p class="activity-log-empty">Loading activity...</p>`;
+  try {
+    const entries = await apiRequest("/api/activity-log?limit=100");
+    activityLogEntries = Array.isArray(entries) ? entries : [];
+  } catch (error) {
+    activityLogEntries = [];
+    activityLogList.innerHTML = `<p class="activity-log-empty">Could not load the Activity Log.</p>`;
+    return;
+  }
+  renderActivityLog();
+};
+
 function renderCards() {
   updateMetrics();
 
@@ -1101,13 +1185,60 @@ const renderStoryDownloadAction = (story, group) => {
 
   if (!canShowButton) return "";
 
-  if (!isStoryAudioUsable(story)) {
+  if (!isStoryAudioUsable(story) && story.status !== "failed") {
     return `<p class="story-audio-note">This story does not have an audio file Feed Your Yoto can use.</p>`;
   }
 
-  if (!isStoryReadyToBringHome(story)) return "";
+  if (story.status !== "failed" && !isStoryReadyToBringHome(story)) return "";
 
-  return `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Prepare Story"}</button>`;
+  const retryButton = `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Prepare Story"}</button>`;
+  const detailsButton = story.status === "failed"
+    ? `<button class="quiet-action" type="button" data-story-details>${story.showDetails ? "Hide details" : "See more"}</button>`
+    : "";
+  return `${retryButton}${detailsButton}`;
+};
+
+const formatFileSize = (value) => {
+  const bytes = Number(value || 0);
+  if (!bytes) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+const renderStoryDetailValue = (label, value) =>
+  value ? `<p><strong>${escapeHtml(label)}</strong><span>${escapeHtml(value)}</span></p>` : "";
+
+const getLatestStoryActivity = (story) =>
+  Array.isArray(story.activityLog) && story.activityLog.length ? story.activityLog[0] : null;
+
+const renderStoryActivityDetails = (story) => {
+  if (!story.showDetails) return "";
+  const latestActivity = getLatestStoryActivity(story);
+  const details = latestActivity?.details || {};
+  const whatHappened =
+    latestActivity?.message ||
+    story.downloadError ||
+    "Feed Your Yoto tried to get this story ready, but the podcast audio link needs help.";
+  const lastTried = latestActivity?.createdAt || story.lastPreparedAt || story.updatedAt || "";
+  const fileSize = formatFileSize(details.fileSize || story.fileSize);
+
+  return `
+    <div class="story-details-panel">
+      <h5>What happened?</h5>
+      <p>${escapeHtml(whatHappened)}</p>
+      <div class="story-detail-grid">
+        ${renderStoryDetailValue("Last tried", lastTried ? formatDateTime(lastTried) : "")}
+        ${renderStoryDetailValue("Step", details.step || story.lastPrepareErrorStep || "Getting story ready")}
+        ${renderStoryDetailValue("Audio host", details.audioUrlHost || story.audioUrlHost)}
+        ${renderStoryDetailValue("Redirects", String(details.redirectCount ?? story.redirectCount ?? ""))}
+        ${renderStoryDetailValue("Final host", details.resolvedAudioUrlHost || story.resolvedAudioUrlHost)}
+        ${renderStoryDetailValue("HTTP status", details.httpStatus || story.lastPrepareHttpStatus ? String(details.httpStatus || story.lastPrepareHttpStatus) : "")}
+        ${renderStoryDetailValue("Content type", details.contentType || story.lastPrepareContentType)}
+        ${renderStoryDetailValue("File size", fileSize)}
+      </div>
+    </div>
+  `;
 };
 
 const renderQueuedStory = (story, group = "new") => {
@@ -1133,6 +1264,7 @@ const renderQueuedStory = (story, group = "new") => {
         <span class="story-status ${story.status === "failed" ? "is-error" : ""}">${escapeHtml(displayStatus)}</span>
         ${story.downloadError ? `<p class="story-error">${escapeHtml(story.downloadError)}</p>` : ""}
         ${renderStoryTracker(story, group)}
+        ${renderStoryActivityDetails(story)}
       </div>
       ${controlMarkup || downloadAction ? `<div class="story-controls">${controlMarkup}${downloadAction}</div>` : ""}
     </article>
@@ -1284,6 +1416,60 @@ const mergeStoryQueueUpdates = (updatedStories) => {
     message: "",
     stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
   });
+};
+
+const toggleStoryDetails = async (storyId) => {
+  if (!activeCardId || !storyId) return;
+
+  const story = storyQueueState.stories.find((item) => item.id === storyId);
+  if (!story) return;
+
+  if (story.showDetails) {
+    setStoryQueueState({
+      stories: storyQueueState.stories.map((item) =>
+        item.id === storyId ? { ...item, showDetails: false } : item
+      ),
+    });
+    return;
+  }
+
+  try {
+    const activityLog = await apiRequest(
+      `/api/story-cards/${encodeURIComponent(activeCardId)}/stories/${encodeURIComponent(storyId)}/activity`
+    );
+    setStoryQueueState({
+      stories: storyQueueState.stories.map((item) =>
+        item.id === storyId ? { ...item, showDetails: true, activityLog } : item
+      ),
+    });
+  } catch (error) {
+    setStoryQueueState({
+      stories: storyQueueState.stories.map((item) =>
+        item.id === storyId
+          ? {
+              ...item,
+              showDetails: true,
+              activityLog: [
+                {
+                  createdAt: item.lastPreparedAt || item.updatedAt || "",
+                  message: item.downloadError || "Feed Your Yoto could not load more details.",
+                  details: {
+                    step: item.lastPrepareErrorStep || "Getting story ready",
+                    audioUrlHost: item.audioUrlHost || "",
+                    redirectCount: item.redirectCount || 0,
+                    resolvedAudioUrlHost: item.resolvedAudioUrlHost || "",
+                    httpStatus: item.lastPrepareHttpStatus || 0,
+                    contentType: item.lastPrepareContentType || "",
+                    contentLength: item.lastPrepareContentLength || 0,
+                    fileSize: item.fileSize || 0,
+                  },
+                },
+              ],
+            }
+          : item
+      ),
+    });
+  }
 };
 
 const downloadQueuedStory = async (storyId) => {
@@ -2197,6 +2383,18 @@ const initializeAuth = async () => {
   }
 };
 
+storyCardsNav?.addEventListener("click", (event) => {
+  event.preventDefault();
+  setActiveView("story-cards");
+});
+
+activityLogNav?.addEventListener("click", (event) => {
+  event.preventDefault();
+  setActiveView("activity-log");
+});
+
+refreshActivityLog?.addEventListener("click", loadActivityLog);
+
 cardGrid.addEventListener("click", (event) => {
   const emptyAddButton = event.target.closest("[data-empty-add]");
   if (emptyAddButton) {
@@ -2275,6 +2473,13 @@ storyQueueContent.addEventListener("click", (event) => {
     if (!requireAuth("Connect Yoto to get this story ready.")) return;
     const storyItem = downloadButton.closest("[data-story-id]");
     downloadQueuedStory(storyItem?.dataset.storyId || "");
+    return;
+  }
+
+  const detailsButton = event.target.closest("[data-story-details]");
+  if (detailsButton) {
+    const storyItem = detailsButton.closest("[data-story-id]");
+    toggleStoryDetails(storyItem?.dataset.storyId || "");
     return;
   }
 

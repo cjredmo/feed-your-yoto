@@ -1673,6 +1673,157 @@ h2 {
   background: var(--blue);
 }
 
+
+.story-details-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 12px;
+  border: 2px solid #ffe4ec;
+  border-radius: 8px;
+  background: #fff8fb;
+}
+
+.story-details-panel h5 {
+  margin: 0;
+  color: var(--blue-dark);
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.story-details-panel > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.story-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.story-detail-grid p {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.story-detail-grid strong {
+  color: var(--blue-dark);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.story-detail-grid span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.activity-log-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.activity-log-panel[hidden] {
+  display: none;
+}
+
+.activity-log-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.activity-log-heading h2 {
+  margin-bottom: 6px;
+}
+
+.activity-log-heading p,
+.activity-log-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.activity-log-list {
+  display: grid;
+  gap: 12px;
+}
+
+.activity-log-item {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border: 2px solid #d9dded;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.activity-log-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.activity-log-meta time {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.activity-level {
+  width: fit-content;
+  border-radius: 999px;
+  padding: 5px 10px;
+  color: var(--blue-dark);
+  background: var(--blue-soft);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.activity-error {
+  color: #8f2442;
+  background: #ffe4ec;
+}
+
+.activity-warning {
+  color: #7c4d00;
+  background: #fff0bd;
+}
+
+.activity-log-copy {
+  display: grid;
+  gap: 5px;
+}
+
+.activity-log-copy h3 {
+  margin: 0;
+  color: var(--blue-dark);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.activity-log-copy p,
+.activity-log-copy span {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2544,7 +2695,8 @@ h2 {
     margin-top: 0;
   }
 
-  .field-grid {
+  
+.field-grid {
     grid-template-columns: 1fr;
   }
 

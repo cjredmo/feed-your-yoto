@@ -23,7 +23,7 @@ const PODCAST_FEED_TIMEOUT_MS = 10_000;
 const PODCAST_FEED_MAX_REDIRECTS = 5;
 const PODCAST_FEED_MAX_BYTES = 2_000_000;
 const STORY_AUDIO_TIMEOUT_MS = 30_000;
-const STORY_AUDIO_MAX_REDIRECTS = 5;
+const STORY_AUDIO_MAX_REDIRECTS = 15;
 const STORY_AUDIO_MAX_BYTES = 150 * 1024 * 1024;
 
 let resolvedDataDir = null;
@@ -49,6 +49,7 @@ const getTokenPath = async () => path.join(await getDataDir(), "yoto_tokens.json
 const getPendingPath = async () => path.join(await getDataDir(), "pending_device_auth.json");
 const getStoryCardsPath = async () => path.join(await getDataDir(), "story_cards.json");
 const getStoryQueuePath = async () => path.join(await getDataDir(), "story_queue.json");
+const getActivityLogPath = async () => path.join(await getDataDir(), "activity_log.json");
 const getDownloadsDir = async () => path.join(await getDataDir(), "downloads");
 
 const sendJson = (response, statusCode, body) => {
@@ -134,6 +135,48 @@ const writeStoryQueue = async (storyQueue) => {
   await writeJsonFile(await getStoryQueuePath(), storyQueue);
 };
 
+const readActivityLog = async () => {
+  const activityLog = await readJsonFile(await getActivityLogPath());
+  return Array.isArray(activityLog) ? activityLog : [];
+};
+
+const writeActivityLog = async (activityLog) => {
+  await writeJsonFile(await getActivityLogPath(), activityLog.slice(0, 500));
+};
+
+const createActivityLogId = () =>
+  `activity-${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`;
+
+const addActivityLogEntry = async (entry = {}) => {
+  const activityLog = await readActivityLog();
+  const nextEntry = {
+    id: createActivityLogId(),
+    createdAt: new Date().toISOString(),
+    level: ["info", "warning", "error"].includes(entry.level) ? entry.level : "info",
+    storyCardId: String(entry.storyCardId || "").trim(),
+    storyId: String(entry.storyId || "").trim(),
+    eventType: String(entry.eventType || "system").trim(),
+    title: String(entry.title || "Feed Your Yoto update").trim(),
+    message: String(entry.message || "").trim(),
+    details: entry.details && typeof entry.details === "object" ? entry.details : {},
+  };
+
+  await writeActivityLog([nextEntry, ...activityLog].slice(0, 500));
+  return nextEntry;
+};
+
+const getActivityLog = async ({ storyCardId = "", storyId = "", level = "", limit = 100 } = {}) => {
+  const numericLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const activityLog = await readActivityLog();
+
+  return activityLog
+    .filter((entry) => !storyCardId || entry.storyCardId === storyCardId)
+    .filter((entry) => !storyId || entry.storyId === storyId)
+    .filter((entry) => !level || entry.level === level)
+    .sort((first, second) => new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime())
+    .slice(0, numericLimit);
+};
+
 const storyStatusLabels = {
   discovered: "New story found",
   selected: "Picked for Yoto",
@@ -178,6 +221,41 @@ const isHttpUrl = (value) => {
   } catch {
     return false;
   }
+};
+
+const getSafeUrlDetails = (value) => {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return {};
+    return {
+      host: url.hostname,
+      pathname: url.pathname || "",
+    };
+  } catch {
+    return {};
+  }
+};
+
+const createDownloadError = (message, status = 502, details = {}) => {
+  const error = createExposedError(message, status);
+  Object.assign(error, details);
+  return error;
+};
+
+const getSafePrepareDetails = (source = {}, story = {}) => {
+  const originalUrlDetails = getSafeUrlDetails(story.audioUrl || source.audioUrl);
+  const resolvedUrlDetails = getSafeUrlDetails(source.resolvedAudioUrl);
+  return {
+    step: source.step || "Getting story ready",
+    technicalMessage: String(source.technicalMessage || source.message || "").slice(0, 240),
+    audioUrlHost: source.audioUrlHost || originalUrlDetails.host || "",
+    redirectCount: Number(source.redirectCount || 0),
+    resolvedAudioUrlHost: source.resolvedAudioUrlHost || resolvedUrlDetails.host || "",
+    httpStatus: Number(source.httpStatus || source.statusCode || 0),
+    contentType: String(source.contentType || "").trim(),
+    contentLength: Number(source.contentLength || 0),
+    fileSize: Number(source.fileSize || 0),
+  };
 };
 
 const validatePodcastLink = (podcastLink) => {
@@ -741,6 +819,15 @@ const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
     guid: String(story.guid ?? existingStory.guid ?? "").trim(),
     audioUrl: isHttpUrl(audioUrl) ? audioUrl : "",
     audioType: String(story.audioType ?? existingStory.audioType ?? "").trim(),
+    resolvedAudioUrl: String(existingStory.resolvedAudioUrl || "").trim(),
+    resolvedAudioUrlHost: String(existingStory.resolvedAudioUrlHost || "").trim(),
+    audioUrlHost: String(existingStory.audioUrlHost || "").trim(),
+    redirectCount: Number(existingStory.redirectCount || 0),
+    lastPrepareHttpStatus: Number(existingStory.lastPrepareHttpStatus || 0),
+    lastPrepareContentType: String(existingStory.lastPrepareContentType || "").trim(),
+    lastPrepareContentLength: Number(existingStory.lastPrepareContentLength || 0),
+    lastPrepareErrorStep: String(existingStory.lastPrepareErrorStep || "").trim(),
+    lastPreparedAt: String(existingStory.lastPreparedAt || "").trim(),
     status,
     statusLabel: storyStatusLabels[status] || storyStatusLabels.discovered,
     downloadStatus: String(existingStory.downloadStatus || "").trim(),
@@ -808,11 +895,20 @@ const discoverStoriesForStoryCard = async (storyCardId) => {
     const xml = await fetchPodcastFeedXml(validatePodcastLink(storyCard.podcastLink));
     const stories = parsePodcastStories(xml);
     const queuedStories = await upsertQueuedStories(storyCardId, stories);
+    const message = stories.length ? `${stories.length} stories found.` : "No stories found yet.";
     await updateStoryCardDiscovery(
       storyCardId,
       "success",
-      stories.length ? `${stories.length} stories found.` : "No stories found yet."
+      message
     );
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      eventType: "story_discovered",
+      title: "Found new stories",
+      message,
+      details: { step: "Checking Podcast Link" },
+    });
     return queuedStories;
   } catch (error) {
     await updateStoryCardDiscovery(
@@ -957,7 +1053,12 @@ const updateQueuedStoryFields = async (storyCardId, storyId, fields) => {
 
 const fetchStoryAudioToFile = async (audioUrl, storyCardId, storyId, redirectCount = 0) => {
   if (redirectCount > STORY_AUDIO_MAX_REDIRECTS) {
-    throw createExposedError("That story moved around too many times.", 502);
+    throw createDownloadError("This podcast's audio link keeps moving around. Try again later.", 502, {
+      audioUrl,
+      redirectCount,
+      step: "Getting story ready",
+      technicalMessage: "Audio URL exceeded the redirect limit.",
+    });
   }
 
   const controller = new AbortController();
@@ -977,29 +1078,64 @@ const fetchStoryAudioToFile = async (audioUrl, storyCardId, storyId, redirectCou
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (!location) {
-        throw createExposedError("The story link moved, but did not tell us where.", 502);
+        throw createDownloadError("The story link moved, but did not tell us where.", 502, {
+          audioUrl,
+          redirectCount,
+          statusCode: response.status,
+          step: "Getting story ready",
+          technicalMessage: "Redirect response did not include a Location header.",
+        });
       }
 
       clearTimeout(timeout);
       const nextUrl = new URL(location, audioUrl).toString();
       if (!isHttpUrl(nextUrl)) {
-        throw createExposedError("This story does not have an audio file Feed Your Yoto can use.");
+        throw createDownloadError("This story does not have an audio file Feed Your Yoto can use.", 400, {
+          audioUrl,
+          redirectCount,
+          resolvedAudioUrl: nextUrl,
+          statusCode: response.status,
+          step: "Getting story ready",
+          technicalMessage: "Redirect target was not an http or https URL.",
+        });
       }
       return fetchStoryAudioToFile(nextUrl, storyCardId, storyId, redirectCount + 1);
     }
 
     if (!response.ok) {
-      throw createExposedError("Feed Your Yoto could not get this story ready.", 502);
+      throw createDownloadError("Feed Your Yoto could not get this story ready.", 502, {
+        audioUrl,
+        redirectCount,
+        resolvedAudioUrl: audioUrl,
+        statusCode: response.status,
+        step: "Getting story ready",
+        technicalMessage: `Audio request failed with HTTP ${response.status}.`,
+      });
     }
 
     const contentLength = Number(response.headers.get("content-length") || 0);
     if (contentLength > STORY_AUDIO_MAX_BYTES) {
-      throw createExposedError("This story is too big to get ready right now.");
+      throw createDownloadError("This story is too big to get ready right now.", 400, {
+        audioUrl,
+        redirectCount,
+        resolvedAudioUrl: audioUrl,
+        contentLength,
+        fileSize: contentLength,
+        step: "Getting story ready",
+        technicalMessage: "Audio file exceeded the configured size limit.",
+      });
     }
 
     const reader = response.body?.getReader();
     if (!reader) {
-      throw createExposedError("Feed Your Yoto could not read this story audio.", 502);
+      throw createDownloadError("Feed Your Yoto could not read this story audio.", 502, {
+        audioUrl,
+        redirectCount,
+        resolvedAudioUrl: audioUrl,
+        statusCode: response.status,
+        step: "Getting story ready",
+        technicalMessage: "Audio response body was not readable.",
+      });
     }
 
     const contentType = String(response.headers.get("content-type") || "").trim();
@@ -1020,7 +1156,16 @@ const fetchStoryAudioToFile = async (audioUrl, storyCardId, storyId, redirectCou
         if (done) break;
         fileSize += value.byteLength;
         if (fileSize > STORY_AUDIO_MAX_BYTES) {
-          throw createExposedError("This story is too big to get ready right now.");
+          throw createDownloadError("This story is too big to get ready right now.", 400, {
+            audioUrl,
+            redirectCount,
+            resolvedAudioUrl: audioUrl,
+            contentType,
+            contentLength,
+            fileSize,
+            step: "Getting story ready",
+            technicalMessage: "Audio file exceeded the configured size limit while downloading.",
+          });
         }
         hash.update(value);
         await file.write(value);
@@ -1036,16 +1181,30 @@ const fetchStoryAudioToFile = async (audioUrl, storyCardId, storyId, redirectCou
       localFileName,
       fileSize,
       contentType,
+      contentLength,
       sha256: hash.digest("hex"),
       downloadedAt: new Date().toISOString(),
+      resolvedAudioUrl: audioUrl,
+      redirectCount,
+      httpStatus: response.status,
     };
   } catch (error) {
     if (tempPath) await deleteFileIfExists(tempPath);
     if (error.expose) throw error;
     if (error.name === "AbortError") {
-      throw createExposedError("The story took too long to get ready. Try again.", 502);
+      throw createDownloadError("The story took too long to get ready. Try again.", 502, {
+        audioUrl,
+        redirectCount,
+        step: "Getting story ready",
+        technicalMessage: "Audio request timed out.",
+      });
     }
-    throw createExposedError("Feed Your Yoto could not get this story ready.", 502);
+    throw createDownloadError("Feed Your Yoto could not get this story ready.", 502, {
+      audioUrl,
+      redirectCount,
+      step: "Getting story ready",
+      technicalMessage: error.message || "Unknown audio download error.",
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -1062,6 +1221,22 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
   }
 
   if (await hasExistingStoryDownload(story)) {
+    const details = getSafePrepareDetails({
+      redirectCount: story.redirectCount,
+      resolvedAudioUrlHost: story.resolvedAudioUrlHost,
+      contentType: story.contentType,
+      fileSize: story.fileSize,
+      httpStatus: story.lastPrepareHttpStatus,
+    }, story);
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId,
+      eventType: "story_prepare_finished",
+      title: "Story ready to send",
+      message: "This story is already ready for the next step.",
+      details,
+    });
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "downloaded",
       downloadStatus: "downloaded",
@@ -1070,10 +1245,27 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
   }
 
   if (!isHttpUrl(story.audioUrl)) {
+    const details = getSafePrepareDetails({
+      step: "Getting story ready",
+      technicalMessage: "Story did not include a usable http or https audio URL.",
+    }, story);
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_prepare_failed",
+      title: "Story needs help",
+      message: "This story does not have an audio file Feed Your Yoto can use.",
+      details,
+    });
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "failed",
       downloadStatus: "failed",
       downloadError: "This story does not have an audio file Feed Your Yoto can use.",
+      audioUrlHost: details.audioUrlHost,
+      redirectCount: details.redirectCount,
+      lastPrepareErrorStep: details.step,
+      lastPreparedAt: new Date().toISOString(),
     });
   }
 
@@ -1082,30 +1274,81 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
     throw createExposedError("Pick this Story for Yoto before getting it ready.");
   }
 
+  const startDetails = getSafePrepareDetails({ step: "Getting story ready" }, story);
+  await addActivityLogEntry({
+    level: "info",
+    storyCardId,
+    storyId,
+    eventType: "story_prepare_started",
+    title: "Getting story ready",
+    message: "Feed Your Yoto is getting this story ready.",
+    details: startDetails,
+  });
+
   await updateQueuedStoryFields(storyCardId, storyId, {
     status: "downloading",
     downloadStatus: "downloading",
     downloadError: "",
+    audioUrlHost: startDetails.audioUrlHost,
+    lastPrepareErrorStep: "",
   });
 
   try {
     const download = await fetchStoryAudioToFile(story.audioUrl, storyCardId, storyId);
+    const details = getSafePrepareDetails(download, story);
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId,
+      eventType: "story_prepare_finished",
+      title: "Story ready to send",
+      message: "This story is ready for the next step.",
+      details,
+    });
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "downloaded",
       downloadStatus: "downloaded",
       downloadedAt: download.downloadedAt,
+      lastPreparedAt: download.downloadedAt,
       localFilePath: download.localFilePath,
       localFileName: download.localFileName,
       fileSize: download.fileSize,
       contentType: download.contentType,
       sha256: download.sha256,
       downloadError: "",
+      resolvedAudioUrl: "",
+      audioUrlHost: details.audioUrlHost,
+      resolvedAudioUrlHost: details.resolvedAudioUrlHost,
+      redirectCount: details.redirectCount,
+      lastPrepareHttpStatus: details.httpStatus,
+      lastPrepareContentType: details.contentType,
+      lastPrepareContentLength: details.contentLength,
+      lastPrepareErrorStep: "",
     });
   } catch (error) {
+    const details = getSafePrepareDetails(error, story);
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_prepare_failed",
+      title: "Story needs help",
+      message: error.expose ? error.message : "Feed Your Yoto could not get this story ready.",
+      details,
+    });
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "failed",
       downloadStatus: "failed",
       downloadError: error.expose ? error.message : "Feed Your Yoto could not get this story ready.",
+      resolvedAudioUrl: "",
+      audioUrlHost: details.audioUrlHost,
+      resolvedAudioUrlHost: details.resolvedAudioUrlHost,
+      redirectCount: details.redirectCount,
+      lastPrepareHttpStatus: details.httpStatus,
+      lastPrepareContentType: details.contentType,
+      lastPrepareContentLength: details.contentLength,
+      lastPrepareErrorStep: details.step,
+      lastPreparedAt: new Date().toISOString(),
     });
   }
 };
@@ -1630,6 +1873,7 @@ const handleApi = async (request, response, pathname) => {
     const storyQueueRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/?$/);
     const storyDiscoverRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/discover\/?$/);
     const playlistPreviewRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/playlist-preview\/?$/);
+    const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
     const storyDownloadRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/download\/?$/);
     const storyQueueItemRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/?$/);
@@ -1663,6 +1907,24 @@ const handleApi = async (request, response, pathname) => {
 
     if (request.method === "POST" && pathname === "/api/podcast/preview") {
       sendJson(response, 200, await previewPodcast(await readRequestJson(request)));
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/api/activity-log") {
+      const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+      sendJson(response, 200, await getActivityLog({
+        storyCardId: url.searchParams.get("storyCardId") || "",
+        storyId: url.searchParams.get("storyId") || "",
+        level: url.searchParams.get("level") || "",
+        limit: url.searchParams.get("limit") || 100,
+      }));
+      return;
+    }
+
+    if (request.method === "GET" && storyActivityRoute) {
+      const storyCardId = decodeURIComponent(storyActivityRoute[1]);
+      const storyId = decodeURIComponent(storyActivityRoute[2]);
+      sendJson(response, 200, await getActivityLog({ storyCardId, storyId, limit: 25 }));
       return;
     }
 

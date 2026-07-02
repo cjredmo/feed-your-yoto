@@ -30,7 +30,8 @@
         </div>
 
         <nav class="nav-list" aria-label="Sections">
-          <a class="nav-item is-active" href="#">My Story Cards</a>
+          <a id="storyCardsNav" class="nav-item is-active" href="#">My Story Cards</a>
+          <a id="activityLogNav" class="nav-item" href="#">Activity Log</a>
           <a class="nav-item" href="#">Podcast Links</a>
           <a class="nav-item" href="#">Settings</a>
           <a class="nav-item" href="#">Help</a>
@@ -41,8 +42,8 @@
         <header class="dashboard-header">
           <div>
             <p class="eyebrow">Feed Your Yoto</p>
-            <h1>My Story Cards</h1>
-            <p class="dashboard-subtitle">
+            <h1 id="dashboardTitle">My Story Cards</h1>
+            <p id="dashboardSubtitle" class="dashboard-subtitle">
               Podcast-powered Story Cards for Story Playlists.
             </p>
           </div>
@@ -61,7 +62,7 @@
           Connect Yoto to add story cards and manage podcast links.
         </div>
 
-        <section class="metric-strip" aria-label="Story Card overview">
+        <section id="storyCardOverview" class="metric-strip" aria-label="Story Card overview">
           <article class="metric-card metric-pink">
             <div>
               <p>Story Cards</p>
@@ -88,7 +89,7 @@
           </article>
         </section>
 
-        <section class="section-heading" aria-labelledby="cardsHeading">
+        <section id="storyCardSectionHeading" class="section-heading" aria-labelledby="cardsHeading">
           <div>
             <h2 id="cardsHeading">Story Cards</h2>
             <p id="storyCardsSummary">4 story cards managed by this app.</p>
@@ -101,6 +102,19 @@
           class="card-grid"
           aria-label="Story Cards managed by this app"
         ></section>
+
+        <section id="activityLogPanel" class="activity-log-panel" aria-label="Activity Log" hidden>
+          <div class="activity-log-heading">
+            <div>
+              <h2>Activity Log</h2>
+              <p>Recent Feed Your Yoto updates and stories that need help.</p>
+            </div>
+            <button id="refreshActivityLog" class="outline-action" type="button">Refresh</button>
+          </div>
+          <div id="activityLogList" class="activity-log-list" aria-live="polite">
+            <p class="activity-log-empty">No activity yet.</p>
+          </div>
+        </section>
       </main>
     </div>
 
