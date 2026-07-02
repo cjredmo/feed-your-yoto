@@ -1330,6 +1330,55 @@ h2 {
   white-space: nowrap;
 }
 
+.story-filter-tags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.story-filter-tag {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 2px solid #d9dded;
+  border-radius: 999px;
+  color: var(--blue-dark);
+  background: #ffffff;
+  font-size: 14px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.story-filter-tag strong {
+  min-width: 26px;
+  min-height: 26px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-size: 12px;
+}
+
+.story-filter-tag.is-selected,
+.story-filter-tag:hover,
+.story-filter-tag:focus-visible {
+  border-color: var(--blue);
+  color: #ffffff;
+  background: var(--blue);
+  outline: none;
+}
+
+.story-filter-tag.is-selected strong,
+.story-filter-tag:hover strong,
+.story-filter-tag:focus-visible strong {
+  color: var(--blue-dark);
+  background: #ffffff;
+}
+
 .playlist-preview-groups {
   display: grid;
   gap: 14px;
@@ -2475,8 +2524,10 @@ h2 {
 
   .story-controls .outline-action,
   .story-controls .quiet-action,
-  .story-download-panel .outline-action {
+  .story-download-panel .outline-action,
+  .story-filter-tag {
     width: 100%;
+    justify-content: center;
   }
 
   .story-controls p {

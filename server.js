@@ -689,21 +689,16 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
     newStories.push(story);
   });
 
-  const pinnedOnYoto = [];
-  const limitedCandidates = [];
-
-  onYotoCandidates.forEach((story) => {
-    if (story.isPinned && rules.favoritesNeverRotate) {
-      pinnedOnYoto.push(story);
-    } else {
-      limitedCandidates.push(story);
-    }
+  const prioritizedCandidates = onYotoCandidates.slice().sort((first, second) => {
+    if (first.isPinned !== second.isPinned) return first.isPinned ? -1 : 1;
+    const firstDate = first.publishedAt || first.firstSeenAt || "";
+    const secondDate = second.publishedAt || second.firstSeenAt || "";
+    return new Date(secondDate).getTime() - new Date(firstDate).getTime();
   });
 
-  const limit = rules.playlistLimit === "all" ? limitedCandidates.length : rules.playlistLimit;
-  const limitedOnYoto = limitedCandidates.slice(0, limit);
-  const oldStoriesResting = [...limitedCandidates.slice(limit), ...oldStoryCandidates];
-  const onYotoSoon = [...pinnedOnYoto, ...limitedOnYoto];
+  const limit = rules.playlistLimit === "all" ? prioritizedCandidates.length : rules.playlistLimit;
+  const onYotoSoon = prioritizedCandidates.slice(0, limit);
+  const oldStoriesResting = [...prioritizedCandidates.slice(limit), ...oldStoryCandidates];
 
   return {
     onYotoSoon,

@@ -18,6 +18,7 @@ let storyQueueState = {
   message: "",
   stories: [],
   pendingUpdates: {},
+  filter: "all",
 };
 let storyDownloadState = {
   storyIds: new Set(),
@@ -813,19 +814,14 @@ const getPlaylistPreview = (rules, stories) => {
     newStories.push(story);
   });
 
-  const pinnedOnYoto = [];
-  const limitedCandidates = [];
-  onYotoCandidates.forEach((story) => {
-    if (story.isPinned && rules.favoritesNeverRotate) {
-      pinnedOnYoto.push(story);
-    } else {
-      limitedCandidates.push(story);
-    }
+  const prioritizedCandidates = onYotoCandidates.slice().sort((first, second) => {
+    if (first.isPinned !== second.isPinned) return first.isPinned ? -1 : 1;
+    return getStorySortValue(second) - getStorySortValue(first);
   });
 
-  const limit = rules.playlistLimit === "all" ? limitedCandidates.length : rules.playlistLimit;
-  const onYotoSoon = [...pinnedOnYoto, ...limitedCandidates.slice(0, limit)];
-  const oldStoriesResting = [...limitedCandidates.slice(limit), ...oldStoryCandidates];
+  const limit = rules.playlistLimit === "all" ? prioritizedCandidates.length : rules.playlistLimit;
+  const onYotoSoon = prioritizedCandidates.slice(0, limit);
+  const oldStoriesResting = [...prioritizedCandidates.slice(limit), ...oldStoryCandidates];
 
   return { onYotoSoon, newStories, skippedStories, oldStoriesResting, favorites };
 };
@@ -912,6 +908,65 @@ const renderBringStoriesHomePanel = (preview) => {
   `;
 };
 
+const getPreviewStorySets = (preview) => ({
+  on_yoto: new Set((preview.onYotoSoon || []).map((story) => story.id)),
+  new: new Set((preview.newStories || []).map((story) => story.id)),
+  favorites: new Set((preview.favorites || []).map((story) => story.id)),
+  old: new Set((preview.oldStoriesResting || []).map((story) => story.id)),
+  skipped: new Set((preview.skippedStories || []).map((story) => story.id)),
+});
+
+const getStoryGroupFromPreview = (story, previewSets) => {
+  if (previewSets.on_yoto.has(story.id)) return "on_yoto";
+  if (previewSets.new.has(story.id)) return "new";
+  if (previewSets.old.has(story.id)) return "old";
+  if (previewSets.skipped.has(story.id)) return "skipped";
+  return "new";
+};
+
+const storyFilterOptions = [
+  { key: "all", label: "All Stories" },
+  { key: "on_yoto", label: "On Yoto Soon" },
+  { key: "new", label: "New Stories" },
+  { key: "favorites", label: "Favorites" },
+  { key: "old", label: "Old Stories Resting" },
+];
+
+const getStoryFilterCounts = (preview, totalCount) => ({
+  all: totalCount,
+  on_yoto: preview.onYotoSoon.length,
+  new: preview.newStories.length,
+  favorites: preview.favorites.length,
+  old: preview.oldStoriesResting.length,
+});
+
+const renderStoryFilterTags = (preview, totalCount) => {
+  const counts = getStoryFilterCounts(preview, totalCount);
+  const selectedFilter = storyQueueState.filter || "all";
+
+  return `
+    <div class="story-filter-tags" role="tablist" aria-label="Story filters">
+      ${storyFilterOptions
+        .map(
+          (option) => `
+            <button class="story-filter-tag ${selectedFilter === option.key ? "is-selected" : ""}" type="button" role="tab" aria-selected="${selectedFilter === option.key}" data-story-filter="${escapeAttribute(option.key)}">
+              <span>${escapeHtml(option.label)}</span>
+              <strong>${counts[option.key] || 0}</strong>
+            </button>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+};
+
+const getFilteredStories = (stories, previewSets) => {
+  const filter = storyQueueState.filter || "all";
+  if (filter === "all") return stories;
+  const matchingIds = previewSets[filter];
+  return matchingIds ? stories.filter((story) => matchingIds.has(story.id)) : stories;
+};
+
 const renderStoryQueue = () => {
   if (!storyQueueContent) return;
 
@@ -956,46 +1011,28 @@ const renderStoryQueue = () => {
     ? `<p class="story-queue-unsaved">${pendingCount} Story Queue change${pendingCount === 1 ? "" : "s"} ready to save.</p>`
     : "";
   const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
-  const hasPreviewStories = [
-    preview.onYotoSoon,
-    preview.newStories,
-    preview.favorites,
-    preview.skippedStories,
-    preview.oldStoriesResting,
-  ].some((group) => group.length > 0);
+  const previewSets = getPreviewStorySets(preview);
+  const sortedStories = sortPreviewStories(storyQueueState.stories);
+  const filteredStories = getFilteredStories(sortedStories, previewSets);
 
   storyQueueContent.innerHTML = `
     ${lastCheckedMarkup}
     ${queueMessageMarkup}
     ${pendingMarkup}
     ${renderBringStoriesHomePanel(preview)}
-    ${hasPreviewStories ? renderPlaylistPreviewGroups(preview) : `<div class="story-queue-empty"><p>No stories found yet.</p></div>`}
+    ${renderStoryFilterTags(preview, storyQueueState.stories.length)}
+    ${
+      filteredStories.length
+        ? `<div class="story-list">${filteredStories
+            .map((story) => {
+              const group = getStoryGroupFromPreview(story, previewSets);
+              return renderQueuedStory(story, group);
+            })
+            .join("")}</div>`
+        : `<div class="story-queue-empty"><p>No stories match this tag yet.</p></div>`
+    }
   `;
 };
-
-const renderPlaylistPreviewGroups = (preview) => `
-  <div class="playlist-preview-groups">
-    ${renderPreviewGroup("On Yoto Soon", "on_yoto", preview.onYotoSoon)}
-    ${renderPreviewGroup("New Stories", "new", preview.newStories)}
-    ${renderPreviewGroup("Favorites", "favorites", preview.favorites)}
-    ${renderPreviewGroup("Skipped Stories", "skipped", preview.skippedStories)}
-    ${renderPreviewGroup("Old Stories Resting", "old", preview.oldStoriesResting)}
-  </div>
-`;
-
-const renderPreviewGroup = (title, group, stories) => `
-  <section class="preview-group" aria-label="${escapeAttribute(title)}">
-    <div class="preview-group-heading">
-      <h5>${escapeHtml(title)}</h5>
-      <span>${stories.length}</span>
-    </div>
-    ${
-      stories.length
-        ? `<div class="story-list">${stories.map((story) => renderQueuedStory(story, group)).join("")}</div>`
-        : `<p class="preview-group-empty">No stories here yet.</p>`
-    }
-  </section>
-`;
 
 const getStoryControlsForGroup = (story, group) => {
   if (group === "new") {
@@ -1070,12 +1107,14 @@ const setStoryQueueState = (nextState) => {
 };
 
 const loadStoryQueue = async (storyCardId, { discoverIfEmpty = false } = {}) => {
+  const isSameStoryCard = storyQueueState.storyCardId === storyCardId;
   setStoryQueueState({
     storyCardId,
     status: "loading",
     message: "",
-    stories: storyQueueState.storyCardId === storyCardId ? storyQueueState.stories : [],
+    stories: isSameStoryCard ? storyQueueState.stories : [],
     pendingUpdates: {},
+    filter: isSameStoryCard ? storyQueueState.filter : "all",
   });
 
   try {
@@ -1381,6 +1420,7 @@ const openEditor = (storyCard) => {
     message: "",
     stories: [],
     pendingUpdates: {},
+    filter: "all",
   });
 
   backdrop.hidden = false;
@@ -2139,6 +2179,12 @@ refreshStories.addEventListener("click", () => {
 });
 
 storyQueueContent.addEventListener("click", (event) => {
+  const filterButton = event.target.closest("[data-story-filter]");
+  if (filterButton) {
+    setStoryQueueState({ filter: filterButton.dataset.storyFilter || "all" });
+    return;
+  }
+
   const bulkDownloadButton = event.target.closest("[data-download-selected]");
   if (bulkDownloadButton) {
     if (!requireAuth("Connect Yoto to get stories ready.")) return;
