@@ -3,11 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Yoto Feed Club</title>
+    <title>Feed Your Yoto</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="window-bar">Yoto Feed Club</div>
+    <div class="window-bar">Feed Your Yoto</div>
 
     <div class="app-shell">
       <aside class="side-panel" aria-label="App menu">
@@ -15,24 +15,24 @@
           <button class="icon-button back-button" type="button" aria-label="Back">
             <span aria-hidden="true">&larr;</span>
           </button>
+          <div class="mascot-badge" aria-hidden="true">
+            <img
+              class="mascot-image"
+              src="assets/feed-your-yoto-mascot.png"
+              alt=""
+            />
+          </div>
         </div>
 
-        <div class="profile-block">
-          <div class="avatar-ring" aria-hidden="true">
-            <div class="avatar-card">
-              <span class="avatar-dot dot-one"></span>
-              <span class="avatar-dot dot-two"></span>
-              <span class="avatar-line line-one"></span>
-              <span class="avatar-line line-two"></span>
-              <span class="avatar-smile"></span>
-            </div>
-          </div>
-          <p class="profile-name">Mio</p>
+        <div class="brand-block">
+          <p class="brand-name">Feed Your Yoto</p>
+          <p class="brand-copy">Story cards for podcasts</p>
         </div>
 
         <nav class="nav-list" aria-label="Sections">
-          <a class="nav-item is-active" href="#">My Cards</a>
-          <a class="nav-item" href="#">Feeds</a>
+          <a id="storyCardsNav" class="nav-item is-active" href="#">My Story Cards</a>
+          <a id="activityLogNav" class="nav-item" href="#">Activity Log</a>
+          <a class="nav-item" href="#">Podcast Links</a>
           <a class="nav-item" href="#">Settings</a>
           <a class="nav-item" href="#">Help</a>
         </nav>
@@ -41,58 +41,80 @@
       <main class="dashboard">
         <header class="dashboard-header">
           <div>
-            <p class="eyebrow">Level 1</p>
-            <h1>Mio's Yoto Cards</h1>
+            <p class="eyebrow">Feed Your Yoto</p>
+            <h1 id="dashboardTitle">My Story Cards</h1>
+            <p id="dashboardSubtitle" class="dashboard-subtitle">
+              Podcast-powered Story Cards for Story Playlists.
+            </p>
           </div>
           <div class="header-actions">
-            <button id="authButton" class="outline-action auth-button" type="button">Login</button>
+            <button id="authButton" class="outline-action auth-button" type="button">
+              Connect Yoto
+            </button>
             <button id="addCardButton" class="primary-action" type="button">
               <span class="button-icon" aria-hidden="true">+</span>
-              Add card
+              Add Story Card
             </button>
           </div>
         </header>
 
         <div id="authBanner" class="auth-banner" role="status" hidden>
-          Connect your Yoto account to add cards and manage podcast feeds.
+          Connect Yoto to add story cards and manage podcast links.
         </div>
 
-        <section class="metric-strip" aria-label="Sync overview">
+        <section id="storyCardOverview" class="metric-strip" aria-label="Story Card overview">
           <article class="metric-card metric-pink">
             <div>
-              <p>Ready cards</p>
-              <strong>4</strong>
+              <p>Story Cards</p>
+              <strong id="storyCardCount">4</strong>
             </div>
             <div class="metric-picture picture-disc" aria-hidden="true"></div>
           </article>
 
           <article class="metric-card metric-blue">
             <div>
-              <p>Cards syncing</p>
-              <strong>2</strong>
+              <p>Cards Updating</p>
+              <strong id="cardsUpdatingCount">2</strong>
             </div>
             <div class="metric-picture picture-crown" aria-hidden="true"></div>
           </article>
 
           <article class="metric-card metric-teal">
             <div>
-              <p>Next crawl</p>
-              <strong>Jun 28, 2026</strong>
-              <span>7:30 PM</span>
+              <p>Next Check</p>
+              <strong id="nextCheckDate">Jun 28, 2026</strong>
+              <span id="nextCheckTime">7:30 PM</span>
             </div>
             <div class="metric-picture picture-hourglass" aria-hidden="true"></div>
           </article>
         </section>
 
-        <section class="section-heading" aria-labelledby="cardsHeading">
+        <section id="storyCardSectionHeading" class="section-heading" aria-labelledby="cardsHeading">
           <div>
-            <h2 id="cardsHeading">Cards</h2>
-            <p>4 cards ready to check.</p>
+            <h2 id="cardsHeading">Story Cards</h2>
+            <p id="storyCardsSummary">4 story cards managed by this app.</p>
           </div>
           <button id="showAllButton" class="outline-action" type="button">Show all</button>
         </section>
 
-        <section id="cardGrid" class="card-grid" aria-label="Uploaded Yoto cards"></section>
+        <section
+          id="cardGrid"
+          class="card-grid"
+          aria-label="Story Cards managed by this app"
+        ></section>
+
+        <section id="activityLogPanel" class="activity-log-panel" aria-label="Activity Log" hidden>
+          <div class="activity-log-heading">
+            <div>
+              <h2>Activity Log</h2>
+              <p>Recent Feed Your Yoto updates and stories that need help.</p>
+            </div>
+            <button id="refreshActivityLog" class="outline-action" type="button">Refresh</button>
+          </div>
+          <div id="activityLogList" class="activity-log-list" aria-live="polite">
+            <p class="activity-log-empty">No activity yet.</p>
+          </div>
+        </section>
       </main>
     </div>
 
@@ -110,71 +132,219 @@
             <span class="cover-shape shape-three"></span>
           </div>
           <div class="preview-copy">
-            <p class="mini-label">Yoto card</p>
+            <p class="mini-label">Story Card</p>
             <h2 id="dialogTitle">Story Station</h2>
-            <p id="dialogStatus" class="status-pill status-live">Live - actively syncing</p>
-            <p id="dialogCrawl" class="next-crawl-line">Next crawl: Jun 28, 2026, 7:30 PM</p>
+            <p id="dialogStatus" class="status-pill status-live">Updating</p>
+            <p id="dialogCrawl" class="next-crawl-line">Next Check: Jun 28, 2026, 7:30 PM</p>
           </div>
         </div>
 
         <form class="dialog-form">
           <div class="dialog-topline">
-            <p class="eyebrow">Auto-feed</p>
+            <p class="eyebrow">Keep Updated</p>
             <button id="closeDialog" class="icon-button close-button" type="button" aria-label="Close">
               <span aria-hidden="true">&times;</span>
             </button>
           </div>
 
-          <div class="field-grid">
-            <label class="field">
-              <span>Playlist name</span>
-              <input id="playlistName" type="text" value="Story Station" />
-            </label>
+          <div class="editor-tabs" role="tablist" aria-label="Story Card sections">
+            <button id="storiesTab" class="editor-tab is-selected" type="button" role="tab" aria-selected="true" aria-controls="storiesPanel" data-editor-tab="stories">Stories</button>
+            <button id="scheduleTab" class="editor-tab" type="button" role="tab" aria-selected="false" aria-controls="schedulePanel" data-editor-tab="schedule">Schedule</button>
+            <button id="setupTab" class="editor-tab" type="button" role="tab" aria-selected="false" aria-controls="setupPanel" data-editor-tab="setup">Setup</button>
+          </div>
 
-            <label class="field">
-              <span>RSS feed</span>
-              <input id="rssFeed" type="url" value="https://example.com/story-station.xml" />
-            </label>
+          <div id="storiesPanel" class="editor-panel" role="tabpanel" aria-labelledby="storiesTab" data-editor-panel="stories">
+            <div class="story-subtabs" role="tablist" aria-label="Story Queue options">
+              <button id="storyQueueSubtab" class="story-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="storyQueuePanel" data-stories-subtab="queue">Story Queue</button>
+              <button id="advancedOptionsSubtab" class="story-subtab" type="button" role="tab" aria-selected="false" aria-controls="advancedOptionsPanel" data-stories-subtab="advanced">Advanced Options</button>
+            </div>
 
-            <label class="field">
-              <span>Yoto card</span>
-              <select id="yotoCard">
-                <option>Blue Make My Own card</option>
-                <option>Pink Make My Own card</option>
-                <option>Yellow Make My Own card</option>
-              </select>
-            </label>
+            <section id="storyQueuePanel" class="story-queue-panel" role="tabpanel" aria-labelledby="storyQueueSubtab" data-stories-subpanel="queue">
+              <div class="story-queue-heading">
+                <div>
+                  <p class="section-kicker">Story Queue</p>
+                  <h3 id="storyQueueTitle">Story Queue</h3>
+                  <p>Stories from this podcast will show up here.</p>
+                </div>
+                <div class="story-queue-actions">
+                  <button id="refreshStories" class="outline-action" type="button">Refresh Stories</button>
+                  <span>Checks the podcast for new stories.</span>
+                </div>
+              </div>
 
+              <section class="playlist-preview-panel" aria-labelledby="playlistPreviewTitle">
+                <div>
+                  <p class="section-kicker">Playlist Preview</p>
+                  <h4 id="playlistPreviewTitle">Playlist Preview</h4>
+                  <p>These are the stories Feed Your Yoto will put on this Story Playlist once syncing is turned on.</p>
+                </div>
+                <div id="storyQueueContent" class="story-queue-content" aria-live="polite">
+                  <p class="story-queue-message">Looking for stories...</p>
+                </div>
+              </section>
+            </section>
+
+            <section id="advancedOptionsPanel" class="story-rules-panel" role="tabpanel" aria-labelledby="advancedOptionsSubtab" data-stories-subpanel="advanced" hidden>
+              <div>
+                <p class="section-kicker">Advanced Options</p>
+                <h4 id="storyRulesTitle">Advanced Options</h4>
+                <p>Choose how new stories join the Story Playlist.</p>
+              </div>
+
+              <div class="story-rule-group" aria-labelledby="newStoriesRuleLabel">
+                <p id="newStoriesRuleLabel">New stories</p>
+                <div class="segmented-control compact-segments">
+                  <button class="segment is-selected" type="button" data-new-story-behavior="auto_pick">Pick Automatically</button>
+                  <button class="segment" type="button" data-new-story-behavior="choose_first">Manual Picking</button>
+                </div>
+                <div class="story-rule-help">
+                  <p><strong>Pick Automatically:</strong> Feed Your Yoto chooses new stories and keeps the playlist moving.</p>
+                  <p><strong>Manual Picking:</strong> You choose which stories go on the playlist.</p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div id="schedulePanel" class="editor-panel" role="tabpanel" aria-labelledby="scheduleTab" data-editor-panel="schedule" hidden>
             <label class="field">
-              <span>Next crawl</span>
+              <span>Next Check</span>
               <input id="nextCrawl" type="datetime-local" value="2026-06-28T19:30" />
             </label>
-          </div>
 
-          <div class="control-group" aria-labelledby="frequencyLabel">
-            <p id="frequencyLabel">Check for new episodes</p>
-            <div class="segmented-control">
-              <button class="segment is-selected" type="button" data-frequency="Daily">Daily</button>
-              <button class="segment" type="button" data-frequency="Weekly">Weekly</button>
-              <button class="segment" type="button" data-frequency="Monthly">Monthly</button>
+            <div class="control-group" aria-labelledby="frequencyLabel">
+              <p id="frequencyLabel">Look for new episodes</p>
+              <div class="segmented-control">
+                <button class="segment is-selected" type="button" data-frequency="daily">Every day</button>
+                <button class="segment" type="button" data-frequency="weekly">Every week</button>
+                <button class="segment" type="button" data-frequency="monthly">Every month</button>
+                <button class="segment" type="button" data-frequency="manual">Only when I press check</button>
+              </div>
+            </div>
+
+            <div class="control-group" aria-labelledby="lateFrequencyLabel">
+              <p id="lateFrequencyLabel">If the new episode is late</p>
+              <div class="segmented-control late-check-control">
+                <button class="segment is-selected" type="button" data-late-frequency="hourly">Keep checking every hour</button>
+                <button class="segment" type="button" data-late-frequency="daily">Keep checking once a day</button>
+                <button class="segment" type="button" data-late-frequency="next">Wait until next time</button>
+              </div>
+            </div>
+
+            <div class="switch-row">
+              <div>
+                <p>Keep Updated</p>
+                <span id="switchStatus">On and watching</span>
+              </div>
+              <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
+                <span></span>
+              </button>
+            </div>
+
+            <div class="dialog-actions schedule-panel-actions">
+              <span class="dialog-action-spacer" aria-hidden="true"></span>
+              <button id="pauseCard" class="quiet-action" type="button">Take a Break</button>
             </div>
           </div>
 
-          <div class="switch-row">
-            <div>
-              <p>Auto-feed</p>
-              <span id="switchStatus">On and watching</span>
+          <div id="setupPanel" class="editor-panel" role="tabpanel" aria-labelledby="setupTab" data-editor-panel="setup" hidden>
+            <div class="field-grid">
+              <label class="field">
+                <span>Story Card Name</span>
+                <input id="playlistName" type="text" value="Story Station" disabled />
+              </label>
+
+              <label class="field">
+                <span>Podcast Link</span>
+                <input id="rssFeed" type="url" value="https://example.com/story-station.xml" disabled />
+                <small>Paste the podcast's RSS feed link here.</small>
+              </label>
+
+              <label class="field">
+                <span>Story Playlist</span>
+                <select id="yotoCard" disabled>
+                  <option>Choose a Story Playlist</option>
+                </select>
+              </label>
             </div>
-            <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
-              <span></span>
-            </button>
+
+            <div class="setup-lock-row">
+              <button id="changeSetupDetails" class="outline-action" type="button">Change setup details</button>
+            </div>
+
+            <div id="setupDetailsPanel" class="setup-details-panel" hidden>
+              <div class="setup-warning" role="note">
+                <strong>Grown-up note</strong>
+                <span>Changing the Story Card name, Podcast Link, or Story Playlist can affect what Feed Your Yoto syncs. Only change these if you are fixing the setup.</span>
+              </div>
+              <label class="setup-checkbox">
+                <input id="setupChangeAcknowledged" type="checkbox" />
+                <span>I understand this changes the setup for this Story Card.</span>
+              </label>
+              <label class="field setup-change-code">
+                <span>Type CHANGE to edit the Podcast Link</span>
+                <input id="podcastChangeCode" type="text" autocomplete="off" />
+              </label>
+            </div>
+
+            <div id="deleteConfirmPanel" class="delete-confirmation" hidden>
+              <div>
+                <p>Remove this setup?</p>
+                <span>The Story Playlist stays safe. This podcast link will stop updating.</span>
+              </div>
+              <div class="delete-confirm-actions">
+                <button id="cancelDeleteCard" class="quiet-action" type="button">Keep It</button>
+                <button id="confirmDeleteCard" class="destructive-action" type="button">Remove Setup</button>
+              </div>
+            </div>
+
+            <div class="dialog-actions setup-panel-actions">
+              <span class="dialog-action-spacer" aria-hidden="true"></span>
+              <button id="deleteCard" class="danger-action" type="button">Remove Setup</button>
+            </div>
           </div>
 
-          <div class="dialog-actions">
-            <button id="pauseCard" class="quiet-action" type="button">Pause</button>
-            <button id="saveCard" class="primary-action" type="button">Save</button>
+          <div class="dialog-actions editor-save-actions">
+            <span class="dialog-action-spacer" aria-hidden="true"></span>
+            <button id="saveCard" class="primary-action" type="button">Save Story Card</button>
           </div>
         </form>
+      </section>
+    </div>
+
+    <div id="setupBackdrop" class="dialog-backdrop setup-backdrop" hidden>
+      <section
+        class="setup-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="setupTitle"
+      >
+        <div class="dialog-topline">
+          <div>
+            <p class="eyebrow">Add Story Card</p>
+            <h2 id="setupTitle">Pick a Story Playlist</h2>
+          </div>
+          <button id="closeSetupDialog" class="icon-button close-button" type="button" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+
+        <div class="setup-progress" aria-label="Setup steps">
+          <span class="setup-step is-active" data-step-indicator="0">1. Pick a Story Playlist</span>
+          <span class="setup-step" data-step-indicator="1">2. Add a podcast link</span>
+          <span class="setup-step" data-step-indicator="2">3. Choose when to check</span>
+        </div>
+
+        <div id="setupStepContent" class="setup-content"></div>
+        <p id="setupError" class="setup-error" role="alert"></p>
+
+        <div class="dialog-actions setup-actions">
+          <button id="cancelSetupButton" class="quiet-action" type="button">Cancel</button>
+          <button id="setupBackButton" class="quiet-action" type="button">Back</button>
+          <button id="setupNextButton" class="primary-action" type="button">Next</button>
+          <button id="saveStoryCardButton" class="primary-action" type="button" hidden>
+            Save Story Card
+          </button>
+        </div>
       </section>
     </div>
 
@@ -188,11 +358,11 @@
           <p class="eyebrow">Yoto account</p>
           <h2 id="authTitle">Connect your Yoto account</h2>
           <p class="auth-copy">
-            Sign in with the Yoto account that owns the MYO card you want to manage.
+            A grown-up needs to sign in with the Yoto account that owns the playlist.
           </p>
           <div class="auth-actions">
             <button id="connectYotoButton" class="primary-action" type="button">
-              Connect Yoto Account
+              Connect Yoto
             </button>
             <button id="notNowButton" class="quiet-action" type="button">Not now</button>
           </div>
@@ -201,7 +371,7 @@
         <div id="authDeviceState" class="auth-state" hidden>
           <p class="eyebrow">Yoto account</p>
           <h2>Finish signing in with Yoto</h2>
-          <p class="auth-copy">Open this link and enter the code below.</p>
+          <p class="auth-copy">Open the Yoto link and enter this code.</p>
           <div class="auth-code-box">
             <span>Code</span>
             <strong id="authUserCode">----</strong>
