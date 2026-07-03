@@ -34,6 +34,7 @@ const storyStatusLabels = {
   skipped: "Skipped for now",
   downloading: "Getting story ready",
   downloaded: "Story ready to send",
+  uploading: "Sending story to Yoto",
   uploaded: "Story sent",
   adding_to_playlist: "Adding to Story Playlist",
   synced: "Ready on Yoto",
@@ -47,7 +48,8 @@ const storyTrackerSteps = [
   { key: "selected", label: "Picked for Yoto" },
   { key: "downloading", label: "Getting story ready" },
   { key: "downloaded", label: "Story ready to send" },
-  { key: "uploaded", label: "Sending story to Yoto" },
+  { key: "uploading", label: "Sending story to Yoto" },
+  { key: "uploaded", label: "Story sent" },
   { key: "adding_to_playlist", label: "Adding to Story Playlist" },
   { key: "synced", label: "Ready on Yoto" },
 ];
@@ -921,6 +923,7 @@ const isStoryAudioUsable = (story) => /^https?:\/\//i.test(String(story?.audioUr
 const isStoryReadyToBringHome = (story) =>
   isStoryAudioUsable(story) &&
   story.status !== "downloaded" &&
+  story.status !== "uploading" &&
   story.status !== "uploaded" &&
   story.status !== "adding_to_playlist" &&
   story.status !== "synced";
@@ -952,9 +955,10 @@ const renderStoryTracker = (story, group = "new") => {
     downloading: 2,
     downloaded: 3,
     failed: 2,
-    uploaded: 4,
-    adding_to_playlist: 5,
-    synced: 6,
+    uploading: 4,
+    uploaded: 5,
+    adding_to_playlist: 6,
+    synced: 7,
   }[trackerStatus] ?? 0;
 
   return `
@@ -1219,9 +1223,10 @@ const renderStoryActivityDetails = (story) => {
   const whatHappened =
     latestActivity?.message ||
     story.downloadError ||
-    "Feed Your Yoto tried to get this story ready, but the podcast audio link needs help.";
-  const lastTried = latestActivity?.createdAt || story.lastPreparedAt || story.updatedAt || "";
-  const fileSize = formatFileSize(details.fileSize || story.fileSize);
+    story.uploadError ||
+    "Feed Your Yoto tried to help this story, but it needs a grown-up check.";
+  const lastTried = latestActivity?.createdAt || story.lastPreparedAt || story.uploadedAt || story.updatedAt || "";
+  const fileSize = formatFileSize(details.fileSize || story.fileSize || story.yotoFileSize);
 
   return `
     <div class="story-details-panel">
@@ -1235,6 +1240,7 @@ const renderStoryActivityDetails = (story) => {
         ${renderStoryDetailValue("Final host", details.resolvedAudioUrlHost || story.resolvedAudioUrlHost)}
         ${renderStoryDetailValue("HTTP status", details.httpStatus || story.lastPrepareHttpStatus ? String(details.httpStatus || story.lastPrepareHttpStatus) : "")}
         ${renderStoryDetailValue("Content type", details.contentType || story.lastPrepareContentType)}
+        ${renderStoryDetailValue("Yoto upload", details.yotoUploadStatus || story.yotoUploadStatus)}
         ${renderStoryDetailValue("File size", fileSize)}
       </div>
     </div>
@@ -1263,6 +1269,7 @@ const renderQueuedStory = (story, group = "new") => {
         <p>${escapeHtml(publishedAt)}</p>
         <span class="story-status ${story.status === "failed" ? "is-error" : ""}">${escapeHtml(displayStatus)}</span>
         ${story.downloadError ? `<p class="story-error">${escapeHtml(story.downloadError)}</p>` : ""}
+        ${story.uploadError ? `<p class="story-error">${escapeHtml(story.uploadError)}</p>` : ""}
         ${renderStoryTracker(story, group)}
         ${renderStoryActivityDetails(story)}
       </div>
@@ -1452,7 +1459,7 @@ const toggleStoryDetails = async (storyId) => {
               activityLog: [
                 {
                   createdAt: item.lastPreparedAt || item.updatedAt || "",
-                  message: item.downloadError || "Feed Your Yoto could not load more details.",
+                  message: item.downloadError || item.uploadError || "Feed Your Yoto could not load more details.",
                   details: {
                     step: item.lastPrepareErrorStep || "Getting story ready",
                     audioUrlHost: item.audioUrlHost || "",
@@ -1461,7 +1468,8 @@ const toggleStoryDetails = async (storyId) => {
                     httpStatus: item.lastPrepareHttpStatus || 0,
                     contentType: item.lastPrepareContentType || "",
                     contentLength: item.lastPrepareContentLength || 0,
-                    fileSize: item.fileSize || 0,
+                    fileSize: item.fileSize || item.yotoFileSize || 0,
+                    yotoUploadStatus: item.yotoUploadStatus || "",
                   },
                 },
               ],
