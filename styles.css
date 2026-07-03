@@ -1581,6 +1581,14 @@ h2 {
   line-height: 1.3;
 }
 
+.story-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1.35;
+}
+
 .story-waiting-note {
   margin: 0;
   color: #6b4b08;
@@ -1605,7 +1613,7 @@ h2 {
 
 .story-tracker ol {
   display: grid;
-  grid-template-columns: repeat(8, minmax(48px, 1fr));
+  grid-template-columns: repeat(5, minmax(72px, 1fr));
   gap: 6px;
   margin: 0;
   padding: 0;

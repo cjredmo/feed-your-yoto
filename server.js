@@ -31,6 +31,10 @@ const YOTO_TRANSCODE_POLL_INTERVAL_MS = 5_000;
 const YOTO_PLAYLIST_PROCESSING_RETRY_MS = 2 * 60 * 1000;
 const YOTO_TRANSCODE_MAX_RETRY_WINDOWS = 30;
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
+const MISSING_AUDIO_DOWNLOAD_MESSAGE =
+  "This story can't be downloaded because it is missing its download link in the RSS feed.";
+const MISSING_AUDIO_TECHNICAL_MESSAGE =
+  "The RSS feed item did not include a usable http or https audio URL.";
 const playlistFailureTypes = new Set([
   "yoto_processing",
   "playlist_payload_error",
@@ -741,10 +745,98 @@ const sortQueuedStories = (stories) =>
     return new Date(secondDate).getTime() - new Date(firstDate).getTime();
   });
 
-const getStoryQueueForStoryCard = async (storyCardId) => {
-  const storyQueue = await readStoryQueue();
-  return sortQueuedStories(storyQueue.filter((story) => story.storyCardId === storyCardId));
+const storyStatusesWithPreparedAudio = new Set([
+  "downloaded",
+  "uploading",
+  "uploaded",
+  "adding_to_playlist",
+  "synced",
+]);
+
+const hasPreparedStoryAudio = (story) =>
+  Boolean(
+    story?.localFilePath ||
+      story?.sha256 ||
+      story?.yotoUploadId ||
+      story?.yotoTrackUrl ||
+      story?.transcodedSha256 ||
+      storyStatusesWithPreparedAudio.has(story?.status)
+  );
+
+const isStoryMissingRssAudio = (story) => !isHttpUrl(story?.audioUrl) && !hasPreparedStoryAudio(story);
+
+const canStoryOccupyPlaylistSlot = (story) => !isStoryMissingRssAudio(story);
+
+const hasStoryLocalDownloadMetadata = (story) =>
+  Boolean(story?.localFilePath && story?.sha256 && Number(story?.fileSize));
+
+const hasAddBackYotoMetadata = (story) =>
+  Boolean(story?.transcodedSha256 || story?.yotoTrackId || story?.yotoTrackUrl || story?.yotoUploadId);
+
+const getAddedBackStoryStatus = (story) => {
+  if (["synced", "adding_to_playlist", "uploaded", "uploading", "downloaded"].includes(story?.status)) {
+    return story.status;
+  }
+  if (hasAddBackYotoMetadata(story)) return "uploaded";
+  if (hasStoryLocalDownloadMetadata(story)) return "downloaded";
+  return "selected";
 };
+
+const getMissingAudioPrepareDetails = (story) =>
+  getSafePrepareDetails({
+    step: "Getting story ready",
+    technicalMessage: MISSING_AUDIO_TECHNICAL_MESSAGE,
+  }, story);
+
+const markMissingAudioStoriesForStoryCard = async (storyCardId) => {
+  const storyQueue = await readStoryQueue();
+  const nextQueue = [...storyQueue];
+  const changedStories = [];
+
+  for (const [index, story] of nextQueue.entries()) {
+    if (story.storyCardId !== storyCardId || !isStoryMissingRssAudio(story)) continue;
+    if (story.status === "failed" && story.downloadError === MISSING_AUDIO_DOWNLOAD_MESSAGE) continue;
+
+    const details = getMissingAudioPrepareDetails(story);
+    const nextStory = {
+      ...story,
+      status: "failed",
+      statusLabel: storyStatusLabels.failed,
+      downloadStatus: "failed",
+      downloadError: MISSING_AUDIO_DOWNLOAD_MESSAGE,
+      audioUrlHost: details.audioUrlHost,
+      redirectCount: details.redirectCount,
+      lastPrepareErrorStep: details.step,
+      lastPreparedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    nextQueue[index] = nextStory;
+    changedStories.push({ story: nextStory, details });
+  }
+
+  if (!changedStories.length) {
+    return sortQueuedStories(storyQueue.filter((story) => story.storyCardId === storyCardId));
+  }
+
+  await writeStoryQueue(nextQueue);
+
+  for (const { story, details } of changedStories) {
+    await addActivityLogEntry({
+      level: "warning",
+      storyCardId,
+      storyId: story.id,
+      eventType: "story_unavailable",
+      title: "Story skipped",
+      message: MISSING_AUDIO_DOWNLOAD_MESSAGE,
+      details,
+    });
+  }
+
+  return sortQueuedStories(nextQueue.filter((story) => story.storyCardId === storyCardId));
+};
+
+const getStoryQueueForStoryCard = async (storyCardId) => markMissingAudioStoriesForStoryCard(storyCardId);
 
 const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
   const rules = withStoryQueueRuleDefaults(storyCard);
@@ -760,13 +852,19 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
     const isSelected = story.isSelected || story.status === "selected" || story.status === "synced";
     const isDiscovered = story.status === "discovered";
     const favoriteIncluded = Boolean(story.isPinned && rules.favoritesNeverRotate);
+    const wantsPlaylistSlot = favoriteIncluded || isSelected || (rules.newStoryBehavior === "auto_pick" && isDiscovered);
+
+    if (isStoryMissingRssAudio(story)) {
+      skippedStories.push(story);
+      return;
+    }
 
     if (isSkipped && !favoriteIncluded) {
       skippedStories.push(story);
       return;
     }
 
-    if (favoriteIncluded || isSelected || (rules.newStoryBehavior === "auto_pick" && isDiscovered)) {
+    if (wantsPlaylistSlot && canStoryOccupyPlaylistSlot(story)) {
       onYotoCandidates.push(story);
       return;
     }
@@ -786,6 +884,9 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
 
   const prioritizedCandidates = onYotoCandidates.slice().sort((first, second) => {
     if (first.isPinned !== second.isPinned) return first.isPinned ? -1 : 1;
+    const firstSelected = Boolean(first.isSelected || first.status === "selected");
+    const secondSelected = Boolean(second.isSelected || second.status === "selected");
+    if (firstSelected !== secondSelected) return firstSelected ? -1 : 1;
     const firstDate = first.publishedAt || first.firstSeenAt || "";
     const secondDate = second.publishedAt || second.firstSeenAt || "";
     return new Date(secondDate).getTime() - new Date(firstDate).getTime();
@@ -900,7 +1001,7 @@ const upsertQueuedStories = async (storyCardId, stories) => {
   });
 
   await writeStoryQueue(nextQueue);
-  return sortQueuedStories(nextQueue.filter((story) => story.storyCardId === storyCardId));
+  return markMissingAudioStoriesForStoryCard(storyCardId);
 };
 
 const updateStoryCardDiscovery = async (storyCardId, status, message) => {
@@ -957,7 +1058,7 @@ const discoverStoriesForStoryCard = async (storyCardId) => {
 };
 
 const updateQueuedStory = async (storyCardId, storyId, body) => {
-  await getStoryCardOrThrow(storyCardId);
+  const { storyCard } = await getStoryCardOrThrow(storyCardId);
 
   const storyQueue = await readStoryQueue();
   const index = storyQueue.findIndex(
@@ -968,20 +1069,35 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
     throw createExposedError("Story not found.", 404);
   }
 
-  const nextStory = { ...storyQueue[index] };
+  const action = String(body.action || "").trim();
+  const previousStory = storyQueue[index];
+  const nextStory = { ...previousStory };
+  const activityEntries = [];
+  const beforePreview = action === "add_back"
+    ? getPlaylistPreviewForStoryCard(storyCard, storyQueue.filter((story) => story.storyCardId === storyCardId))
+    : null;
 
-  ["isPinned", "isSelected", "isSkipped"].forEach((field) => {
-    if (Object.prototype.hasOwnProperty.call(body, field)) {
-      nextStory[field] = Boolean(body[field]);
+  if (action === "add_back") {
+    if (!canStoryOccupyPlaylistSlot(nextStory)) {
+      throw createExposedError("This story needs an audio file before it can be added back.");
     }
-  });
+    nextStory.isSelected = true;
+    nextStory.isSkipped = false;
+    nextStory.status = getAddedBackStoryStatus(nextStory);
+  } else {
+    ["isPinned", "isSelected", "isSkipped"].forEach((field) => {
+      if (Object.prototype.hasOwnProperty.call(body, field)) {
+        nextStory[field] = Boolean(body[field]);
+      }
+    });
 
-  if (Object.prototype.hasOwnProperty.call(body, "status")) {
-    const status = String(body.status || "").trim();
-    if (!editableStoryStatuses.has(status)) {
-      throw createExposedError("That Story status cannot be changed here.");
+    if (Object.prototype.hasOwnProperty.call(body, "status")) {
+      const status = String(body.status || "").trim();
+      if (!editableStoryStatuses.has(status)) {
+        throw createExposedError("That Story status cannot be changed here.");
+      }
+      nextStory.status = status;
     }
-    nextStory.status = status;
   }
 
   if (nextStory.status === "selected") {
@@ -1002,9 +1118,91 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
   nextStory.statusLabel = storyStatusLabels[nextStory.status] || storyStatusLabels.discovered;
   nextStory.updatedAt = new Date().toISOString();
   storyQueue[index] = nextStory;
+
+  if (!previousStory.isPinned && nextStory.isPinned) {
+    activityEntries.push({
+      storyId: nextStory.id,
+      eventType: "story_favorited",
+      title: "Story marked as favorite",
+      message: "Story marked as favorite.",
+    });
+  }
+
+  if (previousStory.isPinned && !nextStory.isPinned) {
+    activityEntries.push({
+      storyId: nextStory.id,
+      eventType: "story_unfavorited",
+      title: "Story removed from favorites",
+      message: "Story removed from favorites.",
+    });
+  }
+
+  if (action === "add_back") {
+    activityEntries.push({
+      storyId: nextStory.id,
+      eventType: "story_added_back",
+      title: "Story added back",
+      message: "Story added back to the playlist.",
+    });
+
+    const afterPreview = getPlaylistPreviewForStoryCard(
+      storyCard,
+      storyQueue.filter((story) => story.storyCardId === storyCardId)
+    );
+    const afterIds = new Set(afterPreview.onYotoSoon.map((story) => story.id));
+    if (!afterIds.has(nextStory.id) && storyCard.playlistLimit !== "all") {
+      throw createExposedError("This playlist is full of favorite stories. Remove a favorite first, then add this story back.");
+    }
+
+    const movedOff = (beforePreview?.onYotoSoon || []).find(
+      (story) =>
+        story.id !== nextStory.id &&
+        !afterIds.has(story.id) &&
+        !(story.isPinned && storyCard.favoritesNeverRotate !== false)
+    );
+
+    if (movedOff) {
+      const movedIndex = storyQueue.findIndex((story) => story.id === movedOff.id);
+      if (movedIndex >= 0) {
+        storyQueue[movedIndex] = {
+          ...storyQueue[movedIndex],
+          isSelected: false,
+          isSkipped: false,
+          status: "rotated_off",
+          statusLabel: storyStatusLabels.rotated_off,
+          updatedAt: new Date().toISOString(),
+        };
+        activityEntries.push({
+          storyId: movedOff.id,
+          eventType: "story_rotated_off",
+          title: "Older story resting",
+          message: "An older story was moved to resting.",
+        });
+      }
+    }
+  }
+
+  if (action === "remove" && nextStory.status === "rotated_off") {
+    activityEntries.push({
+      storyId: nextStory.id,
+      eventType: "story_rotated_off",
+      title: "Older story resting",
+      message: "An older story was moved to resting.",
+    });
+  }
+
   await writeStoryQueue(storyQueue);
 
-  return nextStory;
+  for (const entry of activityEntries) {
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      ...entry,
+      details: { step: "Updating Story Queue" },
+    });
+  }
+
+  return storyQueue.find((story) => story.id === storyId) || nextStory;
 };
 
 
@@ -1295,23 +1493,20 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
   }
 
   if (!isHttpUrl(story.audioUrl)) {
-    const details = getSafePrepareDetails({
-      step: "Getting story ready",
-      technicalMessage: "Story did not include a usable http or https audio URL.",
-    }, story);
+    const details = getMissingAudioPrepareDetails(story);
     await addActivityLogEntry({
-      level: "error",
+      level: "warning",
       storyCardId,
       storyId,
-      eventType: "story_prepare_failed",
-      title: "Story needs help",
-      message: "This story does not have an audio file Feed Your Yoto can use.",
+      eventType: "story_unavailable",
+      title: "Story skipped",
+      message: MISSING_AUDIO_DOWNLOAD_MESSAGE,
       details,
     });
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "failed",
       downloadStatus: "failed",
-      downloadError: "This story does not have an audio file Feed Your Yoto can use.",
+      downloadError: MISSING_AUDIO_DOWNLOAD_MESSAGE,
       audioUrlHost: details.audioUrlHost,
       redirectCount: details.redirectCount,
       lastPrepareErrorStep: details.step,
@@ -1421,7 +1616,11 @@ const downloadSelectedStories = async (storyCardId) => {
       (story) => story.id === storyId
     );
 
-    if (!currentStory || !isHttpUrl(currentStory.audioUrl)) continue;
+    if (!currentStory) continue;
+    if (!isHttpUrl(currentStory.audioUrl)) {
+      if (currentStory.status === "failed") failed.push(currentStory);
+      continue;
+    }
     if (await hasExistingStoryDownload(currentStory)) continue;
 
     const updatedStory = await downloadStoryAudio(storyCardId, storyId);
