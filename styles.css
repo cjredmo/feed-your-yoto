@@ -1597,7 +1597,7 @@ h2 {
 
 .story-tracker ol {
   display: grid;
-  grid-template-columns: repeat(7, minmax(54px, 1fr));
+  grid-template-columns: repeat(8, minmax(48px, 1fr));
   gap: 6px;
   margin: 0;
   padding: 0;

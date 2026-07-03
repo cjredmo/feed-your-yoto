@@ -1634,6 +1634,11 @@ const getSafeUploadDetails = (source = {}, story = {}) => ({
     story
   ),
   yotoUploadStatus: String(source.yotoUploadStatus || source.uploadStatus || "").trim(),
+  yotoTrackId: String(source.yotoTrackId || "").trim(),
+  yotoDuration: Number(source.yotoDuration || 0),
+  yotoFileSize: Number(source.yotoFileSize || story.yotoFileSize || 0),
+  contentType: String(source.contentType || story.contentType || "").trim(),
+  fileSize: Number(source.fileSize || story.fileSize || 0),
 });
 
 const createYotoUploadError = (message, status = 502, details = {}, story = {}) => {
@@ -1642,11 +1647,13 @@ const createYotoUploadError = (message, status = 502, details = {}, story = {}) 
   return error;
 };
 
+const getYotoUploadEnvelope = (uploadResult = {}) =>
+  uploadResult?.upload || uploadResult?.data?.upload || uploadResult?.data || uploadResult || {};
+
 const normalizeYotoUploadResult = (uploadResult = {}) => {
-  const upload = uploadResult?.upload || uploadResult?.data?.upload || uploadResult?.data || uploadResult || {};
-  const uploadUrlValue = Object.prototype.hasOwnProperty.call(upload, "uploadUrl")
-    ? upload.uploadUrl
-    : upload.url || upload.signedUrl || "";
+  const upload = getYotoUploadEnvelope(uploadResult);
+  const hasUploadUrlField = Object.prototype.hasOwnProperty.call(upload, "uploadUrl");
+  const uploadUrlValue = hasUploadUrlField ? upload.uploadUrl : upload.signedUrl || "";
   const trackUrlValue = upload.trackUrl || upload.mediaUrl || upload.transcodedUrl || "";
   const inferredStatus = uploadUrlValue === null
     ? "already_available"
@@ -1655,6 +1662,7 @@ const normalizeYotoUploadResult = (uploadResult = {}) => {
       : "";
 
   return {
+    hasUploadUrlField,
     uploadUrl: isHttpUrl(uploadUrlValue) ? uploadUrlValue : null,
     yotoUploadId: String(upload.yotoUploadId || upload.uploadId || upload.id || upload.fileId || "").trim(),
     yotoTrackId: String(upload.trackId || upload.track?.id || upload.mediaId || "").trim(),
@@ -1680,7 +1688,7 @@ const getYotoUploadInstructions = async (story) => {
 
   const tokens = await getAuthenticatedTokens();
   if (!tokens) {
-    throw createYotoUploadError("Connect Yoto before sending stories.", 401, {
+    throw createYotoUploadError("Feed Your Yoto needs to reconnect to Yoto.", 401, {
       step: "Asking Yoto where to send the story",
       technicalMessage: "No authenticated Yoto access token was available.",
       yotoUploadStatus: "not_authenticated",
@@ -1698,22 +1706,38 @@ const getYotoUploadInstructions = async (story) => {
     const instructions = normalizeYotoUploadResult(response.data);
 
     if (!instructions.yotoUploadId) {
-      throw createYotoUploadError("Yoto did not send back upload details yet.", 502, {
+      throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
         step: "Asking Yoto where to send the story",
         technicalMessage: "Upload URL response did not include uploadId.",
         yotoUploadStatus: instructions.yotoUploadStatus || "missing_upload_id",
       }, story);
     }
 
+    if (!instructions.hasUploadUrlField) {
+      throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
+        step: "Asking Yoto where to send the story",
+        technicalMessage: "Upload URL response did not include uploadUrl.",
+        yotoUploadStatus: instructions.yotoUploadStatus || "missing_upload_url",
+      }, story);
+    }
+
     return instructions;
   } catch (error) {
     if (error.expose) throw error;
-    throw createYotoUploadError("Yoto needs help starting this story upload.", 502, {
-      step: "Asking Yoto where to send the story",
-      httpStatus: error.status,
-      technicalMessage: error.data?.message || error.data?.error || error.message,
-      yotoUploadStatus: "instruction_failed",
-    }, story);
+    const authProblem = error.status === 401 || error.status === 403;
+    throw createYotoUploadError(
+      authProblem
+        ? "Feed Your Yoto needs to reconnect to Yoto."
+        : "Yoto could not accept this story right now.",
+      authProblem ? 401 : 502,
+      {
+        step: "Asking Yoto where to send the story",
+        httpStatus: error.status,
+        technicalMessage: error.data?.message || error.data?.error || error.message,
+        yotoUploadStatus: authProblem ? "not_authenticated" : "instruction_failed",
+      },
+      story
+    );
   }
 };
 
@@ -1724,14 +1748,6 @@ const pollYotoUploadIfNeeded = async (uploadResult) => {
 };
 
 const uploadStoryFileToYoto = async (story) => {
-  if (!(await hasExistingStoryDownload(story))) {
-    throw createYotoUploadError("Get this story ready before sending it to Yoto.", 400, {
-      step: "Sending story to Yoto",
-      technicalMessage: "The local story audio file is missing.",
-      yotoUploadStatus: "missing_file",
-    }, story);
-  }
-
   const fileStats = await fs.stat(story.localFilePath);
   const instructions = await getYotoUploadInstructions({
     ...story,
@@ -1741,12 +1757,15 @@ const uploadStoryFileToYoto = async (story) => {
     ...instructions,
     uploadUrl: undefined,
     yotoFileSize: instructions.yotoFileSize || story.fileSize || fileStats.size,
+    contentType: story.contentType,
+    fileSize: story.fileSize || fileStats.size,
   };
 
   if (!instructions.uploadUrl) {
     return pollYotoUploadIfNeeded({
       ...safeInstructions,
-      yotoUploadStatus: instructions.yotoUploadStatus || "already_available",
+      yotoUploadStatus: "uploaded",
+      yotoTranscodeStatus: instructions.yotoUploadStatus || "already_available",
     });
   }
 
@@ -1755,8 +1774,8 @@ const uploadStoryFileToYoto = async (story) => {
 
   try {
     const fileBuffer = await fs.readFile(story.localFilePath);
-    // TODO: Verify with Yoto whether the signed upload URL requires PUT exactly and
-    // whether the content-type header should be preserved for every audio format.
+    // TODO: Yoto documents a signed upload URL but not the HTTP method in the generated page.
+    // Keep this isolated until real-account testing confirms PUT is the correct signed URL method.
     const response = await fetch(instructions.uploadUrl, {
       method: "PUT",
       headers: {
@@ -1768,7 +1787,7 @@ const uploadStoryFileToYoto = async (story) => {
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw createYotoUploadError("Yoto needs help receiving this story.", 502, {
+      throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
         step: "Sending story to Yoto",
         httpStatus: response.status,
         technicalMessage: text || `Signed upload URL returned HTTP ${response.status}.`,
@@ -1784,13 +1803,13 @@ const uploadStoryFileToYoto = async (story) => {
   } catch (error) {
     if (error.expose) throw error;
     if (error.name === "AbortError") {
-      throw createYotoUploadError("Yoto took too long receiving this story. Try again.", 502, {
+      throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
         step: "Sending story to Yoto",
         technicalMessage: "Signed upload URL request timed out.",
         yotoUploadStatus: "timed_out",
       }, story);
     }
-    throw createYotoUploadError("Yoto needs help receiving this story.", 502, {
+    throw createYotoUploadError("Feed Your Yoto could not send this story to Yoto.", 502, {
       step: "Sending story to Yoto",
       technicalMessage: error.message || "Unknown Yoto upload error.",
       yotoUploadStatus: "upload_failed",
@@ -1800,7 +1819,51 @@ const uploadStoryFileToYoto = async (story) => {
   }
 };
 
-const uploadQueuedStoryToYoto = async (storyCardId, storyId) => {
+const getStoryDownloadUploadProblem = async (story) => {
+  if (!story?.localFilePath || !Number(story?.fileSize) || !story?.contentType || !story?.sha256) {
+    return {
+      message: "Get this story ready before sending it to Yoto.",
+      technicalMessage: "Story is missing local download metadata required for upload.",
+      yotoUploadStatus: "missing_download_metadata",
+    };
+  }
+
+  if (!(await fileExists(story.localFilePath))) {
+    return {
+      message: "The downloaded story file is missing. Try preparing it again.",
+      technicalMessage: "Local story audio file was not found on disk.",
+      yotoUploadStatus: "missing_file",
+    };
+  }
+
+  return null;
+};
+
+const markStoryUploadFailed = async (storyCardId, storyId, story, message, details = {}) => {
+  const safeDetails = getSafeUploadDetails({
+    step: "Sending story to Yoto",
+    yotoUploadStatus: "failed",
+    ...details,
+  }, story);
+
+  await addActivityLogEntry({
+    level: "error",
+    storyCardId,
+    storyId,
+    eventType: "story_upload_failed",
+    title: "Story needs help",
+    message,
+    details: safeDetails,
+  });
+
+  return updateQueuedStoryFields(storyCardId, storyId, {
+    status: "failed",
+    yotoUploadStatus: safeDetails.yotoUploadStatus || "failed",
+    uploadError: message,
+  });
+};
+
+const uploadDownloadedStoryToYoto = async (storyCardId, storyId) => {
   await getStoryCardOrThrow(storyCardId);
 
   const storyQueue = await readStoryQueue();
@@ -1808,6 +1871,20 @@ const uploadQueuedStoryToYoto = async (storyCardId, storyId) => {
   if (!story) {
     throw createExposedError("Story not found.", 404);
   }
+
+  const uploadProblem = await getStoryDownloadUploadProblem(story);
+  if (uploadProblem) {
+    return markStoryUploadFailed(storyCardId, storyId, story, uploadProblem.message, {
+      technicalMessage: uploadProblem.technicalMessage,
+      yotoUploadStatus: uploadProblem.yotoUploadStatus,
+    });
+  }
+
+  await updateQueuedStoryFields(storyCardId, storyId, {
+    status: "uploading",
+    yotoUploadStatus: "uploading",
+    uploadError: "",
+  });
 
   const startDetails = getSafeUploadDetails({
     step: "Sending story to Yoto",
@@ -1823,15 +1900,13 @@ const uploadQueuedStoryToYoto = async (storyCardId, storyId) => {
     details: startDetails,
   });
 
-  await updateQueuedStoryFields(storyCardId, storyId, {
-    status: "uploading",
-    yotoUploadStatus: "uploading",
-    uploadError: "",
-  });
-
   try {
     const upload = await uploadStoryFileToYoto(story);
-    const details = getSafeUploadDetails(upload, story);
+    const details = getSafeUploadDetails({
+      ...upload,
+      step: "Sending story to Yoto",
+      yotoUploadStatus: "uploaded",
+    }, story);
     const uploadedAt = new Date().toISOString();
 
     await addActivityLogEntry({
@@ -1840,13 +1915,13 @@ const uploadQueuedStoryToYoto = async (storyCardId, storyId) => {
       storyId,
       eventType: "story_upload_finished",
       title: "Story sent",
-      message: "This story was sent to Yoto. Feed Your Yoto has not changed the Story Playlist yet.",
+      message: "This story was sent to Yoto.",
       details,
     });
 
     return updateQueuedStoryFields(storyCardId, storyId, {
       status: "uploaded",
-      yotoUploadStatus: upload.yotoUploadStatus || "uploaded",
+      yotoUploadStatus: "uploaded",
       yotoUploadId: upload.yotoUploadId || "",
       yotoTrackId: upload.yotoTrackId || "",
       yotoTrackUrl: upload.yotoTrackUrl || "",
@@ -1858,22 +1933,33 @@ const uploadQueuedStoryToYoto = async (storyCardId, storyId) => {
     });
   } catch (error) {
     const details = getSafeUploadDetails(error, story);
-    await addActivityLogEntry({
-      level: "error",
-      storyCardId,
-      storyId,
-      eventType: "story_upload_failed",
-      title: "Story needs help",
-      message: error.expose ? error.message : "Yoto needs help receiving this story.",
-      details,
-    });
-
-    return updateQueuedStoryFields(storyCardId, storyId, {
-      status: "failed",
-      yotoUploadStatus: details.yotoUploadStatus || "failed",
-      uploadError: error.expose ? error.message : "Yoto needs help receiving this story.",
-    });
+    const message = error.expose ? error.message : "Feed Your Yoto could not send this story to Yoto.";
+    return markStoryUploadFailed(storyCardId, storyId, story, message, details);
   }
+};
+
+const uploadReadyStoriesToYoto = async (storyCardId) => {
+  await getStoryCardOrThrow(storyCardId);
+  const uploaded = [];
+  const failed = [];
+  const readyStories = (await getStoryQueueForStoryCard(storyCardId)).filter(
+    (story) => story.status === "downloaded"
+  );
+
+  for (const story of readyStories) {
+    const updatedStory = await uploadDownloadedStoryToYoto(storyCardId, story.id);
+    if (updatedStory.status === "uploaded") {
+      uploaded.push(updatedStory);
+    } else if (updatedStory.status === "failed") {
+      failed.push(updatedStory);
+    }
+  }
+
+  return {
+    uploaded,
+    failed,
+    stories: await getStoryQueueForStoryCard(storyCardId),
+  };
 };
 
 const getCreatedYotoPlaylistId = (data) =>
@@ -2151,6 +2237,7 @@ const handleApi = async (request, response, pathname) => {
     const playlistPreviewRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/playlist-preview\/?$/);
     const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
+    const storyUploadReadyRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/upload-ready\/?$/);
     const storyDownloadRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/download\/?$/);
     const storyUploadRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/upload\/?$/);
     const storyQueueItemRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/?$/);
@@ -2232,6 +2319,12 @@ const handleApi = async (request, response, pathname) => {
       return;
     }
 
+    if (request.method === "POST" && storyUploadReadyRoute) {
+      const storyCardId = decodeURIComponent(storyUploadReadyRoute[1]);
+      sendJson(response, 200, await uploadReadyStoriesToYoto(storyCardId));
+      return;
+    }
+
     if (request.method === "POST" && storyDownloadRoute) {
       const storyCardId = decodeURIComponent(storyDownloadRoute[1]);
       const storyId = decodeURIComponent(storyDownloadRoute[2]);
@@ -2242,7 +2335,7 @@ const handleApi = async (request, response, pathname) => {
     if (request.method === "POST" && storyUploadRoute) {
       const storyCardId = decodeURIComponent(storyUploadRoute[1]);
       const storyId = decodeURIComponent(storyUploadRoute[2]);
-      sendJson(response, 200, await uploadQueuedStoryToYoto(storyCardId, storyId));
+      sendJson(response, 200, await uploadDownloadedStoryToYoto(storyCardId, storyId));
       return;
     }
 

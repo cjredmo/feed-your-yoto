@@ -22,6 +22,7 @@ let storyQueueState = {
 };
 let storyDownloadState = {
   storyIds: new Set(),
+  uploadIds: new Set(),
   bulk: false,
   processing: false,
 };
@@ -942,6 +943,7 @@ const getStoryDisplayStatus = (story, group = "new") => {
 
 const getStoryTrackerStatus = (story, group = "new") => {
   if (group === "on_yoto" && story.status === "discovered") return "selected";
+  if (story.status === "failed" && story.yotoUploadStatus === "failed") return "uploading";
   return story.status;
 };
 
@@ -976,13 +978,38 @@ const renderStoryTracker = (story, group = "new") => {
   `;
 };
 
+const hasStoryDownloadMetadata = (story) =>
+  Boolean(story?.localFilePath && Number(story?.fileSize) && story?.contentType && story?.sha256);
+
+const missingDownloadedFileMessage = "The downloaded story file is missing. Try preparing it again.";
+
+const isStoryReadyToUpload = (story) => story?.status === "downloaded" && hasStoryDownloadMetadata(story);
+
+const shouldRetryStoryUpload = (story) =>
+  story?.status === "failed" &&
+  story?.yotoUploadStatus === "failed" &&
+  hasStoryDownloadMetadata(story) &&
+  !String(story.uploadError || "").toLowerCase().includes(missingDownloadedFileMessage.toLowerCase());
+
 const getStoriesNeedingPreparation = (preview) =>
   (preview.onYotoSoon || []).filter(isStoryReadyToBringHome);
 
+const getStoriesReadyToUpload = (stories) => (stories || []).filter(isStoryReadyToUpload);
+
 const renderStoryStatusSummary = (preview) => {
   const storiesToPrepare = getStoriesNeedingPreparation(preview).length;
+  const storiesToSend = getStoriesReadyToUpload(storyQueueState.stories).length;
   const needsHelpCount = storyQueueState.stories.filter((story) => story.status === "failed").length;
   const isAutomaticMode = getEditorStoryRules().newStoryBehavior !== "choose_first";
+  const automaticNote = storyDownloadState.processing
+    ? storiesToSend
+      ? "Sending stories to Yoto..."
+      : "Getting stories ready..."
+    : storiesToPrepare
+      ? "Feed Your Yoto will get picked stories ready automatically."
+      : storiesToSend
+        ? "Feed Your Yoto will send ready stories to Yoto automatically."
+        : "Everything picked is ready.";
 
   return `
     <section class="story-status-summary" aria-labelledby="storyPlaylistStatusTitle">
@@ -997,17 +1024,7 @@ const renderStoryStatusSummary = (preview) => {
         <span><strong>${preview.favorites.length}</strong> Favorites</span>
         <span><strong>${needsHelpCount}</strong> Needs help</span>
       </div>
-      ${
-        isAutomaticMode
-          ? `<p class="story-auto-note">${
-              storyDownloadState.processing
-                ? "Getting stories ready..."
-                : storiesToPrepare
-                  ? "Feed Your Yoto will get picked stories ready automatically."
-                  : "Everything picked is ready for the next step."
-            }</p>`
-          : renderManualPreparePanel(storiesToPrepare)
-      }
+      ${isAutomaticMode ? `<p class="story-auto-note">${automaticNote}</p>` : renderManualPreparePanel(storiesToPrepare)}
     </section>
   `;
 };
@@ -1182,24 +1199,33 @@ const getStoryControlsForGroup = (story, group) => {
 
 const renderStoryDownloadAction = (story, group) => {
   const isManualMode = getEditorStoryRules().newStoryBehavior === "choose_first";
-  const canShowButton =
-    story.status === "failed" ||
-    (isManualMode && (group === "on_yoto" || story.isSelected || story.status === "selected"));
-  const isBusy = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
+  const isDownloading = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
+  const isUploading = storyDownloadState.uploadIds.has(story.id) || story.status === "uploading";
 
-  if (!canShowButton) return "";
+  if (story.status === "failed") {
+    const retryUploads = shouldRetryStoryUpload(story);
+    const busy = retryUploads ? isUploading : isDownloading;
+    const retryButton = `<button class="outline-action" type="button" data-retry-story ${busy ? "disabled" : ""}>${busy ? (retryUploads ? "Sending story..." : "Getting story ready...") : "Try Again"}</button>`;
+    const detailsButton = `<button class="quiet-action" type="button" data-story-details>${story.showDetails ? "Hide details" : "See more"}</button>`;
+    return `${retryButton}${detailsButton}`;
+  }
 
-  if (!isStoryAudioUsable(story) && story.status !== "failed") {
+  if (!isManualMode) return "";
+
+  if (isStoryReadyToUpload(story)) {
+    return `<button class="outline-action" type="button" data-upload-story ${isUploading ? "disabled" : ""}>${isUploading ? "Sending story..." : "Send to Yoto"}</button>`;
+  }
+
+  const canPrepare = group === "on_yoto" || story.isSelected || story.status === "selected";
+  if (!canPrepare) return "";
+
+  if (!isStoryAudioUsable(story)) {
     return `<p class="story-audio-note">This story does not have an audio file Feed Your Yoto can use.</p>`;
   }
 
-  if (story.status !== "failed" && !isStoryReadyToBringHome(story)) return "";
+  if (!isStoryReadyToBringHome(story)) return "";
 
-  const retryButton = `<button class="outline-action" type="button" data-download-story ${isBusy ? "disabled" : ""}>${isBusy ? "Getting story ready..." : story.status === "failed" ? "Try Again" : "Prepare Story"}</button>`;
-  const detailsButton = story.status === "failed"
-    ? `<button class="quiet-action" type="button" data-story-details>${story.showDetails ? "Hide details" : "See more"}</button>`
-    : "";
-  return `${retryButton}${detailsButton}`;
+  return `<button class="outline-action" type="button" data-download-story ${isDownloading ? "disabled" : ""}>${isDownloading ? "Getting story ready..." : "Prepare Story"}</button>`;
 };
 
 const formatFileSize = (value) => {
@@ -1234,7 +1260,7 @@ const renderStoryActivityDetails = (story) => {
       <p>${escapeHtml(whatHappened)}</p>
       <div class="story-detail-grid">
         ${renderStoryDetailValue("Last tried", lastTried ? formatDateTime(lastTried) : "")}
-        ${renderStoryDetailValue("Step", details.step || story.lastPrepareErrorStep || "Getting story ready")}
+        ${renderStoryDetailValue("Step", details.step || story.lastPrepareErrorStep || (story.uploadError ? "Sending story to Yoto" : "Getting story ready"))}
         ${renderStoryDetailValue("Audio host", details.audioUrlHost || story.audioUrlHost)}
         ${renderStoryDetailValue("Redirects", String(details.redirectCount ?? story.redirectCount ?? ""))}
         ${renderStoryDetailValue("Final host", details.resolvedAudioUrlHost || story.resolvedAudioUrlHost)}
@@ -1458,7 +1484,7 @@ const toggleStoryDetails = async (storyId) => {
               showDetails: true,
               activityLog: [
                 {
-                  createdAt: item.lastPreparedAt || item.updatedAt || "",
+                  createdAt: item.uploadedAt || item.lastPreparedAt || item.updatedAt || "",
                   message: item.downloadError || item.uploadError || "Feed Your Yoto could not load more details.",
                   details: {
                     step: item.lastPrepareErrorStep || "Getting story ready",
@@ -1506,31 +1532,92 @@ const downloadQueuedStory = async (storyId) => {
   }
 };
 
+const uploadQueuedStory = async (storyId) => {
+  if (!activeCardId || !storyId) return;
+
+  const nextUploadIds = new Set(storyDownloadState.uploadIds);
+  nextUploadIds.add(storyId);
+  setStoryDownloadState({ uploadIds: nextUploadIds });
+
+  try {
+    await savePendingStoryQueueChanges(activeCardId);
+    const updatedStory = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(activeCardId)}/stories/${encodeURIComponent(storyId)}/upload`,
+      "POST"
+    );
+    mergeStoryQueueUpdates(updatedStory);
+  } catch (error) {
+    setStoryQueueState({
+      status: "loaded",
+      message: error.message || "Feed Your Yoto could not send this story to Yoto.",
+    });
+  } finally {
+    const remainingUploadIds = new Set(storyDownloadState.uploadIds);
+    remainingUploadIds.delete(storyId);
+    setStoryDownloadState({ uploadIds: remainingUploadIds });
+  }
+};
+
+const retryQueuedStory = (storyId) => {
+  const story = storyQueueState.stories.find((item) => item.id === storyId);
+  if (!story) return;
+
+  if (shouldRetryStoryUpload(story)) {
+    uploadQueuedStory(storyId);
+    return;
+  }
+
+  downloadQueuedStory(storyId);
+};
+
 const processStoriesForStoryCard = async (storyCardId) => {
   if (!storyCardId || getEditorStoryRules().newStoryBehavior === "choose_first") return;
   if (storyDownloadState.processing) return;
 
   const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
   const storiesToPrepare = getStoriesNeedingPreparation(preview);
-  if (!storiesToPrepare.length) return;
+  const storiesToUpload = getStoriesReadyToUpload(storyQueueState.stories);
+  if (!storiesToPrepare.length && !storiesToUpload.length) return;
 
   setStoryDownloadState({ processing: true });
 
   try {
-    const result = await jsonRequest(
-      `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/download-selected`,
-      "POST"
-    );
+    let workingStories = storyQueueState.stories;
+    let helpMessage = "";
+
+    if (storiesToPrepare.length) {
+      const downloadResult = await jsonRequest(
+        `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/download-selected`,
+        "POST"
+      );
+      workingStories = Array.isArray(downloadResult.stories) ? downloadResult.stories : workingStories;
+      if (downloadResult.failed?.length) {
+        helpMessage = "Some stories need help before they can get ready.";
+      }
+    }
+
+    const readyAfterDownload = getStoriesReadyToUpload(workingStories);
+    if (readyAfterDownload.length) {
+      const uploadResult = await jsonRequest(
+        `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/upload-ready`,
+        "POST"
+      );
+      workingStories = Array.isArray(uploadResult.stories) ? uploadResult.stories : workingStories;
+      if (uploadResult.failed?.length) {
+        helpMessage = "Some stories need help before they can be sent to Yoto.";
+      }
+    }
+
     setStoryQueueState({
       status: "loaded",
-      message: result.failed?.length ? "Some stories need help before they can get ready." : "",
-      stories: Array.isArray(result.stories) ? result.stories : storyQueueState.stories,
+      message: helpMessage,
+      stories: workingStories,
       pendingUpdates: {},
     });
   } catch (error) {
     setStoryQueueState({
       status: "loaded",
-      message: error.message || "Feed Your Yoto could not get stories ready.",
+      message: error.message || "Feed Your Yoto could not send stories to Yoto.",
     });
   } finally {
     setStoryDownloadState({ processing: false });
@@ -2481,6 +2568,22 @@ storyQueueContent.addEventListener("click", (event) => {
     if (!requireAuth("Connect Yoto to get this story ready.")) return;
     const storyItem = downloadButton.closest("[data-story-id]");
     downloadQueuedStory(storyItem?.dataset.storyId || "");
+    return;
+  }
+
+  const uploadButton = event.target.closest("[data-upload-story]");
+  if (uploadButton) {
+    if (!requireAuth("Connect Yoto to send this story.")) return;
+    const storyItem = uploadButton.closest("[data-story-id]");
+    uploadQueuedStory(storyItem?.dataset.storyId || "");
+    return;
+  }
+
+  const retryButton = event.target.closest("[data-retry-story]");
+  if (retryButton) {
+    if (!requireAuth("Connect Yoto to try this story again.")) return;
+    const storyItem = retryButton.closest("[data-story-id]");
+    retryQueuedStory(storyItem?.dataset.storyId || "");
     return;
   }
 
