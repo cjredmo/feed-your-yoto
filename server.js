@@ -26,6 +26,19 @@ const STORY_AUDIO_TIMEOUT_MS = 30_000;
 const STORY_AUDIO_MAX_REDIRECTS = 15;
 const STORY_AUDIO_MAX_BYTES = 150 * 1024 * 1024;
 const YOTO_UPLOAD_TIMEOUT_MS = 120_000;
+const YOTO_TRANSCODE_MAX_ATTEMPTS = 12;
+const YOTO_TRANSCODE_POLL_INTERVAL_MS = 5_000;
+const YOTO_PLAYLIST_PROCESSING_RETRY_MS = 2 * 60 * 1000;
+const YOTO_TRANSCODE_MAX_RETRY_WINDOWS = 30;
+const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
+const playlistFailureTypes = new Set([
+  "yoto_processing",
+  "playlist_payload_error",
+  "playlist_not_found",
+  "yoto_auth",
+  "yoto_http_error",
+  "unknown",
+]);
 
 let resolvedDataDir = null;
 
@@ -86,6 +99,8 @@ const deleteFileIfExists = async (filePath) => {
     if (error.code !== "ENOENT") throw error;
   }
 };
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const readRequestJson = (request) =>
   new Promise((resolve, reject) => {
@@ -844,11 +859,21 @@ const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
     yotoUploadId: String(existingStory.yotoUploadId || "").trim(),
     yotoTrackId: String(existingStory.yotoTrackId || "").trim(),
     yotoTrackUrl: String(existingStory.yotoTrackUrl || "").trim(),
+    transcodedSha256: String(existingStory.transcodedSha256 || "").trim(),
     yotoTranscodeStatus: String(existingStory.yotoTranscodeStatus || "").trim(),
+    yotoTranscodeRetryAfter: String(existingStory.yotoTranscodeRetryAfter || "").trim(),
+    yotoTranscodeLastCheckedAt: String(existingStory.yotoTranscodeLastCheckedAt || "").trim(),
+    yotoTranscodePollCount: Number(existingStory.yotoTranscodePollCount || 0),
     yotoDuration: Number(existingStory.yotoDuration || 0),
     yotoFileSize: Number(existingStory.yotoFileSize || 0),
+    yotoFormat: String(existingStory.yotoFormat || "").trim(),
+    yotoChannels: String(existingStory.yotoChannels || "").trim(),
     uploadedAt: String(existingStory.uploadedAt || "").trim(),
     uploadError: String(existingStory.uploadError || "").trim(),
+    playlistUpdateStatus: String(existingStory.playlistUpdateStatus || "").trim(),
+    playlistUpdateError: String(existingStory.playlistUpdateError || "").trim(),
+    playlistUpdateRetryAfter: String(existingStory.playlistUpdateRetryAfter || "").trim(),
+    playlistUpdateFailureType: String(existingStory.playlistUpdateFailureType || "").trim(),
     isPinned: Boolean(existingStory.isPinned),
     isSelected: Boolean(existingStory.isSelected),
     isSkipped: Boolean(existingStory.isSkipped),
@@ -1056,9 +1081,16 @@ const updateQueuedStoryFields = async (storyCardId, storyId, fields) => {
   } else if (status === "uploading") {
     nextStory.yotoUploadStatus = "uploading";
   } else if (status === "uploaded") {
-    nextStory.yotoUploadStatus = "uploaded";
+    nextStory.yotoUploadStatus = fields.yotoUploadStatus || nextStory.yotoUploadStatus || "uploaded";
     nextStory.isSkipped = false;
     nextStory.isSelected = true;
+  } else if (status === "adding_to_playlist") {
+    nextStory.playlistUpdateStatus = fields.playlistUpdateStatus || "adding";
+  } else if (status === "synced") {
+    nextStory.playlistUpdateStatus = "synced";
+    nextStory.playlistUpdateError = "";
+    nextStory.playlistUpdateRetryAfter = "";
+    nextStory.playlistUpdateFailureType = "";
   } else if (status === "failed") {
     if (fields.downloadStatus) nextStory.downloadStatus = fields.downloadStatus;
     if (fields.yotoUploadStatus) nextStory.yotoUploadStatus = fields.yotoUploadStatus;
@@ -1618,6 +1650,48 @@ const postYotoJsonWithRefresh = async (pathName, tokens, body) => {
   }
 };
 
+const normalizePlaylistFailureType = (value) => {
+  const failureType = String(value || "").trim();
+  return playlistFailureTypes.has(failureType) ? failureType : "unknown";
+};
+
+const getYotoProcessingRetryAfter = () =>
+  new Date(Date.now() + YOTO_PLAYLIST_PROCESSING_RETRY_MS).toISOString();
+
+const isYotoProcessingError = (source = {}) => {
+  const text = String(
+    source.technicalMessage || source.message || source.playlistUpdateError || source.uploadError || ""
+  ).toLowerCase();
+  return (
+    source.failureType === "yoto_processing" ||
+    source.yotoUploadStatus === "transcode_timeout" ||
+    source.yotoUploadStatus === "processing" ||
+    source.yotoTranscodeStatus === "processing" ||
+    Boolean(source.yotoTranscodeRetryAfter) ||
+    (text.includes("transcod") && (text.includes("timed out") || text.includes("processing"))) ||
+    (text.includes("still") && text.includes("ready")) ||
+    text.includes("not ready")
+  );
+};
+
+const classifyPlaylistFailure = (source = {}) => {
+  const explicit = normalizePlaylistFailureType(source.failureType);
+  if (explicit !== "unknown") return explicit;
+
+  const httpStatus = Number(source.httpStatus || source.statusCode || source.status || 0);
+  const text = String(
+    source.technicalMessage || source.message || source.data?.message || source.data?.error || ""
+  ).toLowerCase();
+  const step = String(source.step || "").toLowerCase();
+
+  if (isYotoProcessingError({ ...source, technicalMessage: text })) return "yoto_processing";
+  if (httpStatus === 401 || httpStatus === 403) return "yoto_auth";
+  if (httpStatus === 404) return "playlist_not_found";
+  if (step.includes("building") || step.includes("payload")) return "playlist_payload_error";
+  if (httpStatus) return "yoto_http_error";
+  return "unknown";
+};
+
 // Yoto upload support is intentionally isolated from Story Playlist updates.
 // It can upload prepared audio to Yoto media, but it does not call /content update APIs.
 const sanitizeDiagnosticText = (value, story = {}) => {
@@ -1628,13 +1702,20 @@ const sanitizeDiagnosticText = (value, story = {}) => {
 
 const getSafeUploadDetails = (source = {}, story = {}) => ({
   step: source.step || "Sending story to Yoto",
+  failureType: normalizePlaylistFailureType(source.failureType),
   httpStatus: Number(source.httpStatus || source.statusCode || source.status || 0),
   technicalMessage: sanitizeDiagnosticText(
     source.technicalMessage || source.message || "",
     story
   ),
   yotoUploadStatus: String(source.yotoUploadStatus || source.uploadStatus || "").trim(),
+  yotoUploadId: String(source.yotoUploadId || story.yotoUploadId || "").trim(),
   yotoTrackId: String(source.yotoTrackId || "").trim(),
+  yotoTranscodeStatus: String(source.yotoTranscodeStatus || story.yotoTranscodeStatus || "").trim(),
+  yotoTranscodeRetryAfter: String(source.yotoTranscodeRetryAfter || story.yotoTranscodeRetryAfter || "").trim(),
+  yotoTranscodeLastCheckedAt: String(source.yotoTranscodeLastCheckedAt || story.yotoTranscodeLastCheckedAt || "").trim(),
+  yotoTranscodePollCount: Number(source.yotoTranscodePollCount || story.yotoTranscodePollCount || 0),
+  hasTranscodedSha256: Boolean(source.transcodedSha256 || story.transcodedSha256 || source.yotoTrackId || story.yotoTrackId),
   yotoDuration: Number(source.yotoDuration || 0),
   yotoFileSize: Number(source.yotoFileSize || story.yotoFileSize || 0),
   contentType: String(source.contentType || story.contentType || "").trim(),
@@ -1741,11 +1822,142 @@ const getYotoUploadInstructions = async (story) => {
   }
 };
 
-const pollYotoUploadIfNeeded = async (uploadResult) => {
-  // TODO: Confirm Yoto's transcode status endpoint and response shape before polling.
-  // For now, keep the upload result isolated and let future playlist work decide when it is ready.
-  return uploadResult;
+const getNormalizedYotoChannels = (value) => {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized === "mono" || normalized === "1") return "mono";
+  if (normalized === "stereo" || normalized === "2") return "stereo";
+  return "";
 };
+
+const getYotoFormatFromStory = (story = {}) => {
+  const explicitFormat = String(story.yotoFormat || "").trim().toLowerCase();
+  if (explicitFormat) return explicitFormat;
+
+  const contentType = String(story.contentType || "").split(";")[0].trim().toLowerCase();
+  const contentTypeFormats = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+  };
+  if (contentTypeFormats[contentType]) return contentTypeFormats[contentType];
+
+  const extension = path.extname(String(story.localFileName || "")).replace(/^\./, "").toLowerCase();
+  return extension || "mp3";
+};
+
+const normalizeYotoTranscodeResult = (data = {}, uploadResult = {}) => {
+  const transcode = data?.transcode || data || {};
+  const mediaInfo = transcode.transcodedInfo || transcode.info || transcode.mediaInfo || {};
+  const transcodedSha256 = String(
+    transcode.transcodedSha256 ||
+      transcode.sha256 ||
+      transcode.transcodedHash ||
+      ""
+  ).trim();
+
+  return {
+    ...uploadResult,
+    transcodedSha256: transcodedSha256 || uploadResult.transcodedSha256 || "",
+    yotoTrackId: transcodedSha256 || uploadResult.yotoTrackId || "",
+    yotoTrackUrl: transcodedSha256 ? `yoto:#${transcodedSha256}` : uploadResult.yotoTrackUrl || "",
+    yotoTranscodeStatus: transcodedSha256
+      ? "ready"
+      : String(transcode.status || uploadResult.yotoTranscodeStatus || "processing").trim(),
+    yotoDuration: Number(mediaInfo.duration || transcode.duration || uploadResult.yotoDuration || 0),
+    yotoFileSize: Number(mediaInfo.fileSize || transcode.fileSize || uploadResult.yotoFileSize || 0),
+    yotoFormat: String(mediaInfo.format || transcode.format || uploadResult.yotoFormat || "").trim(),
+    yotoChannels: getNormalizedYotoChannels(mediaInfo.channels || transcode.channels || uploadResult.yotoChannels),
+  };
+};
+
+const isYotoTranscodeFailureStatus = (status) => {
+  const normalized = String(status || "").trim().toLowerCase();
+  return ["failed", "failure", "error", "errored", "rejected"].includes(normalized);
+};
+
+const pollYotoUploadIfNeeded = async (uploadResult, story = {}, options = {}) => {
+  if (uploadResult.yotoTrackUrl && String(uploadResult.yotoTrackUrl).startsWith("yoto:#")) {
+    return uploadResult;
+  }
+
+  if (!uploadResult.yotoUploadId) {
+    throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
+      step: "Checking Yoto story audio",
+      technicalMessage: "Missing uploadId for transcode polling.",
+      yotoUploadStatus: "missing_upload_id",
+    }, story);
+  }
+
+  let tokens = await getAuthenticatedTokens();
+  if (!tokens) {
+    throw createYotoUploadError("Feed Your Yoto needs to reconnect to Yoto.", 401, {
+      step: "Checking Yoto story audio",
+      technicalMessage: "No authenticated Yoto access token was available.",
+      yotoUploadStatus: "not_authenticated",
+    }, story);
+  }
+
+  const maxAttempts = Math.max(Number(options.maxAttempts || YOTO_TRANSCODE_MAX_ATTEMPTS), 1);
+  const intervalMs = Math.max(Number(options.intervalMs ?? YOTO_TRANSCODE_POLL_INTERVAL_MS), 0);
+  let lastHttpStatus = 0;
+  let lastTechnicalMessage = "Transcoding timed out before transcodedSha256 was returned.";
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await getYotoJsonWithRefresh(
+        `/media/upload/${encodeURIComponent(uploadResult.yotoUploadId)}/transcoded?loudnorm=false`,
+        tokens
+      );
+      tokens = response.tokens;
+      const normalized = normalizeYotoTranscodeResult(response.data, uploadResult);
+      if (isYotoTranscodeFailureStatus(normalized.yotoTranscodeStatus)) {
+        throw createYotoUploadError("Yoto could not get this story ready.", 502, {
+          step: "Waiting on Yoto",
+          technicalMessage: "Yoto reported a failed transcode status.",
+          yotoUploadStatus: "failed",
+          yotoUploadId: uploadResult.yotoUploadId,
+          yotoTranscodeStatus: "failed",
+          yotoTranscodeLastCheckedAt: new Date().toISOString(),
+          yotoTranscodePollCount: Number(story.yotoTranscodePollCount || 0) + attempt + 1,
+        }, story);
+      }
+      if (normalized.yotoTrackUrl) return normalized;
+      lastTechnicalMessage = `Yoto transcode status: ${normalized.yotoTranscodeStatus || "processing"}.`;
+    } catch (error) {
+      if (error.expose && error.yotoTranscodeStatus === "failed") throw error;
+      lastHttpStatus = Number(error.status || error.httpStatus || 0);
+      lastTechnicalMessage = error.data?.message || error.data?.error || error.technicalMessage || error.message || lastTechnicalMessage;
+      if (![404, 409, 425].includes(Number(error.status || 0))) {
+        throw createYotoUploadError("Yoto could not accept this story right now.", 502, {
+          step: "Checking Yoto story audio",
+          httpStatus: error.status,
+          technicalMessage: error.data?.message || error.data?.error || error.message,
+          yotoUploadStatus: "transcode_check_failed",
+        }, story);
+      }
+    }
+
+    if (attempt < maxAttempts - 1 && intervalMs) await wait(intervalMs);
+  }
+
+  throw createYotoUploadError(YOTO_PROCESSING_MESSAGE, 202, {
+    step: "Waiting on Yoto",
+    failureType: "yoto_processing",
+    httpStatus: lastHttpStatus,
+    technicalMessage: lastTechnicalMessage,
+    yotoUploadStatus: "processing",
+    yotoUploadId: uploadResult.yotoUploadId,
+    yotoTranscodeStatus: "processing",
+    yotoTranscodeRetryAfter: getYotoProcessingRetryAfter(),
+    yotoTranscodeLastCheckedAt: new Date().toISOString(),
+    yotoTranscodePollCount: Number(story.yotoTranscodePollCount || 0) + maxAttempts,
+  }, story);
+};
+
 
 const uploadStoryFileToYoto = async (story) => {
   const fileStats = await fs.stat(story.localFilePath);
@@ -1766,7 +1978,7 @@ const uploadStoryFileToYoto = async (story) => {
       ...safeInstructions,
       yotoUploadStatus: "uploaded",
       yotoTranscodeStatus: instructions.yotoUploadStatus || "already_available",
-    });
+    }, story);
   }
 
   const controller = new AbortController();
@@ -1799,7 +2011,7 @@ const uploadStoryFileToYoto = async (story) => {
       ...safeInstructions,
       httpStatus: response.status,
       yotoUploadStatus: "uploaded",
-    });
+    }, story);
   } catch (error) {
     if (error.expose) throw error;
     if (error.name === "AbortError") {
@@ -1872,6 +2084,10 @@ const uploadDownloadedStoryToYoto = async (storyCardId, storyId) => {
     throw createExposedError("Story not found.", 404);
   }
 
+  if (hasPendingYotoTranscode(story)) {
+    return checkYotoTranscodeStatusForStory(storyCardId, storyId, { poll: true });
+  }
+
   const uploadProblem = await getStoryDownloadUploadProblem(story);
   if (uploadProblem) {
     return markStoryUploadFailed(storyCardId, storyId, story, uploadProblem.message, {
@@ -1902,37 +2118,18 @@ const uploadDownloadedStoryToYoto = async (storyCardId, storyId) => {
 
   try {
     const upload = await uploadStoryFileToYoto(story);
-    const details = getSafeUploadDetails({
+    return markYotoTranscodeReady(storyCardId, storyId, story, {
       ...upload,
       step: "Sending story to Yoto",
       yotoUploadStatus: "uploaded",
-    }, story);
-    const uploadedAt = new Date().toISOString();
-
-    await addActivityLogEntry({
-      level: "info",
-      storyCardId,
-      storyId,
-      eventType: "story_upload_finished",
-      title: "Story sent",
-      message: "This story was sent to Yoto.",
-      details,
-    });
-
-    return updateQueuedStoryFields(storyCardId, storyId, {
-      status: "uploaded",
-      yotoUploadStatus: "uploaded",
-      yotoUploadId: upload.yotoUploadId || "",
-      yotoTrackId: upload.yotoTrackId || "",
-      yotoTrackUrl: upload.yotoTrackUrl || "",
-      yotoTranscodeStatus: upload.yotoTranscodeStatus || "",
-      yotoDuration: upload.yotoDuration || 0,
-      yotoFileSize: upload.yotoFileSize || story.fileSize || 0,
-      uploadedAt,
-      uploadError: "",
     });
   } catch (error) {
     const details = getSafeUploadDetails(error, story);
+
+    if (isYotoProcessingError(details) && details.yotoUploadId) {
+      return markYotoTranscodeWaiting(storyCardId, storyId, story, details);
+    }
+
     const message = error.expose ? error.message : "Feed Your Yoto could not send this story to Yoto.";
     return markStoryUploadFailed(storyCardId, storyId, story, message, details);
   }
@@ -1941,6 +2138,7 @@ const uploadDownloadedStoryToYoto = async (storyCardId, storyId) => {
 const uploadReadyStoriesToYoto = async (storyCardId) => {
   await getStoryCardOrThrow(storyCardId);
   const uploaded = [];
+  const waiting = [];
   const failed = [];
   const readyStories = (await getStoryQueueForStoryCard(storyCardId)).filter(
     (story) => story.status === "downloaded"
@@ -1948,7 +2146,9 @@ const uploadReadyStoriesToYoto = async (storyCardId) => {
 
   for (const story of readyStories) {
     const updatedStory = await uploadDownloadedStoryToYoto(storyCardId, story.id);
-    if (updatedStory.status === "uploaded") {
+    if (updatedStory.status === "uploaded" && updatedStory.yotoUploadStatus === "processing") {
+      waiting.push(updatedStory);
+    } else if (updatedStory.status === "uploaded") {
       uploaded.push(updatedStory);
     } else if (updatedStory.status === "failed") {
       failed.push(updatedStory);
@@ -1957,10 +2157,830 @@ const uploadReadyStoriesToYoto = async (storyCardId) => {
 
   return {
     uploaded,
+    waiting,
     failed,
     stories: await getStoryQueueForStoryCard(storyCardId),
   };
 };
+
+
+const getSafeStringArray = (value) =>
+  (Array.isArray(value) ? value : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .slice(0, 50);
+
+const getSafePlaylistMetadataSummary = (value) =>
+  (Array.isArray(value) ? value : [])
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      storyId: String(item.storyId || item.id || "").trim(),
+      title: sanitizeDiagnosticText(item.title || ""),
+      hasYotoUploadId: Boolean(item.yotoUploadId),
+      hasYotoTrackId: Boolean(item.yotoTrackId),
+      hasYotoTrackUrl: Boolean(String(item.yotoTrackUrl || "").startsWith("yoto:#")),
+      hasTranscodedSha256: Boolean(item.transcodedSha256 || item.yotoTrackId),
+      yotoUploadStatus: String(item.yotoUploadStatus || "").trim(),
+      yotoTranscodeStatus: String(item.yotoTranscodeStatus || "").trim(),
+      yotoTranscodePollCount: Number(item.yotoTranscodePollCount || 0),
+      yotoDuration: Number(item.yotoDuration || 0),
+      yotoFileSize: Number(item.yotoFileSize || item.fileSize || 0),
+      yotoFormat: String(item.yotoFormat || "").trim(),
+      missingMetadataFields: getSafeStringArray(item.missingMetadataFields),
+    }))
+    .slice(0, 50);
+
+const getSafeYotoResponseShape = (value = {}) => {
+  const card = value?.card || value || {};
+  const chapters = asArray(card?.content?.chapters);
+  const tracks = chapters.flatMap((chapter) => asArray(chapter?.tracks));
+  return {
+    hasCard: Boolean(value?.card || card?.cardId || card?._id || card?.id),
+    cardId: String(card?.cardId || card?.id || card?._id || "").trim(),
+    contentKeys: card?.content && typeof card.content === "object" ? Object.keys(card.content).slice(0, 20) : [],
+    metadataKeys: card?.metadata && typeof card.metadata === "object" ? Object.keys(card.metadata).slice(0, 20) : [],
+    chapterCount: chapters.length,
+    trackCount: tracks.length,
+    populatedTrackCount: tracks.filter((track) => String(track?.trackUrl || "").startsWith("yoto:#")).length,
+  };
+};
+
+const getSafePlaylistDetails = (source = {}, storyCard = {}) => {
+  const failureType = classifyPlaylistFailure(source);
+  return {
+    step: source.step || "Adding to Story Playlist",
+    failureType,
+    storyCardId: String(source.storyCardId || storyCard.id || "").trim(),
+    yotoPlaylistId: String(source.yotoPlaylistId || storyCard.yotoPlaylistId || "").trim(),
+    yotoPlaylistTitle: String(source.yotoPlaylistTitle || storyCard.yotoPlaylistTitle || storyCard.name || "").trim(),
+    trackCount: Number(source.trackCount || source.builtTrackCount || 0),
+    intendedTrackCount: Number(source.intendedTrackCount || source.intendedStoriesCount || 0),
+    readyTrackCount: Number(source.readyTrackCount || source.readyStoriesCount || 0),
+    builtTrackCount: Number(source.builtTrackCount || source.trackCount || 0),
+    sentTrackCount: Number(source.sentTrackCount || 0),
+    verifiedTrackCount: Number(source.verifiedTrackCount || 0),
+    syncedCount: Number(source.syncedCount || 0),
+    storyIdsAttempted: getSafeStringArray(source.storyIdsAttempted || source.storyIds),
+    storyTitlesIncluded: getSafeStringArray(source.storyTitlesIncluded || source.storyTitles).map(sanitizeDiagnosticText),
+    missingMetadataFields: getSafeStringArray(source.missingMetadataFields),
+    uploadTrackMetadata: getSafePlaylistMetadataSummary(source.uploadTrackMetadata || source.trackMetadataUsed),
+    responseShape: source.responseShape && typeof source.responseShape === "object" ? source.responseShape : undefined,
+    verifiedResponseShape: source.verifiedResponseShape && typeof source.verifiedResponseShape === "object" ? source.verifiedResponseShape : undefined,
+    playlistUpdateStatus: String(source.playlistUpdateStatus || "").trim(),
+    playlistUpdateRetryAfter: String(source.playlistUpdateRetryAfter || source.retryAfter || "").trim(),
+    yotoUploadStatus: String(source.yotoUploadStatus || "").trim(),
+    yotoTranscodeStatus: String(source.yotoTranscodeStatus || "").trim(),
+    yotoTranscodeRetryAfter: String(source.yotoTranscodeRetryAfter || "").trim(),
+    yotoTranscodeLastCheckedAt: String(source.yotoTranscodeLastCheckedAt || "").trim(),
+    yotoTranscodePollCount: Number(source.yotoTranscodePollCount || 0),
+    httpStatus: Number(source.httpStatus || source.statusCode || source.status || 0),
+    technicalMessage: sanitizeDiagnosticText(
+      source.technicalMessage || source.data?.message || source.data?.error || source.message || ""
+    ),
+  };
+};
+
+const createYotoPlaylistUpdateError = (message, status = 502, details = {}, storyCard = {}) => {
+  const error = createExposedError(message, status);
+  Object.assign(error, getSafePlaylistDetails(details, storyCard));
+  return error;
+};
+
+const getTranscodedSha256FromStory = (story = {}) => {
+  const explicitSha = String(story.transcodedSha256 || story.yotoTrackId || "").trim().replace(/^yoto:#/, "");
+  if (explicitSha) return explicitSha;
+
+  const trackUrl = String(story.yotoTrackUrl || "").trim();
+  if (trackUrl.startsWith("yoto:#")) return trackUrl.replace(/^yoto:#/, "");
+  return "";
+};
+
+const getYotoTrackUrlFromStory = (story = {}) => {
+  const transcodedSha256 = getTranscodedSha256FromStory(story);
+  if (transcodedSha256) return `yoto:#${transcodedSha256}`;
+  return "";
+};
+
+const hasUsableYotoTrackMetadata = (story = {}) =>
+  Boolean(
+    getTranscodedSha256FromStory(story) &&
+      getYotoTrackUrlFromStory(story) &&
+      Number(story.yotoFileSize || story.fileSize || 0)
+  );
+
+const hasPendingYotoTranscode = (story = {}) =>
+  Boolean(story.yotoUploadId && !hasUsableYotoTrackMetadata(story));
+
+const getStoredYotoUploadForStory = (story = {}) => ({
+  yotoUploadId: story.yotoUploadId,
+  yotoTrackId: story.yotoTrackId,
+  yotoTrackUrl: story.yotoTrackUrl,
+  transcodedSha256: story.transcodedSha256,
+  yotoTranscodeStatus: story.yotoTranscodeStatus,
+  yotoDuration: story.yotoDuration,
+  yotoFileSize: story.yotoFileSize,
+  yotoFormat: story.yotoFormat,
+  yotoChannels: story.yotoChannels,
+  contentType: story.contentType,
+  fileSize: story.fileSize,
+});
+
+const getQueuedStoryById = async (storyCardId, storyId) => {
+  const storyQueue = await readStoryQueue();
+  return storyQueue.find((item) => item.storyCardId === storyCardId && item.id === storyId) || null;
+};
+
+const markYotoTranscodeWaiting = async (storyCardId, storyId, story, details = {}) => {
+  const now = details.yotoTranscodeLastCheckedAt || new Date().toISOString();
+  const retryAfter = details.yotoTranscodeRetryAfter || details.playlistUpdateRetryAfter || getYotoProcessingRetryAfter();
+  const pollCount = Number(details.yotoTranscodePollCount || story.yotoTranscodePollCount || 0) || 0;
+
+  if (pollCount > YOTO_TRANSCODE_MAX_RETRY_WINDOWS * YOTO_TRANSCODE_MAX_ATTEMPTS) {
+    return markYotoTranscodeFailed(storyCardId, storyId, story,
+      "Yoto is taking longer than expected getting this story ready. Try again in a little while.",
+      {
+        ...details,
+        step: "Waiting on Yoto",
+        technicalMessage: "Transcode retry window limit was reached.",
+        yotoUploadStatus: "failed",
+        yotoTranscodeStatus: "failed",
+      }
+    );
+  }
+
+  const safeDetails = getSafeUploadDetails({
+    ...details,
+    step: "Waiting on Yoto",
+    failureType: "yoto_processing",
+    yotoUploadStatus: "processing",
+    yotoTranscodeStatus: "processing",
+    yotoTranscodeRetryAfter: retryAfter,
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: pollCount,
+  }, story);
+
+  await addActivityLogEntry({
+    level: "warning",
+    storyCardId,
+    storyId,
+    eventType: "story_transcode_waiting",
+    title: "Waiting on Yoto",
+    message: YOTO_PROCESSING_MESSAGE,
+    details: safeDetails,
+  });
+
+  return updateQueuedStoryFields(storyCardId, storyId, {
+    status: "uploaded",
+    yotoUploadStatus: "processing",
+    yotoUploadId: details.yotoUploadId || story.yotoUploadId || "",
+    yotoTranscodeStatus: "processing",
+    yotoTranscodeRetryAfter: retryAfter,
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: pollCount,
+    yotoFileSize: details.yotoFileSize || story.yotoFileSize || story.fileSize || 0,
+    yotoFormat: details.yotoFormat || story.yotoFormat || getYotoFormatFromStory(story),
+    uploadedAt: story.uploadedAt || new Date().toISOString(),
+    uploadError: "",
+    playlistUpdateStatus: "waiting",
+    playlistUpdateError: YOTO_PROCESSING_MESSAGE,
+    playlistUpdateRetryAfter: retryAfter,
+    playlistUpdateFailureType: "yoto_processing",
+  });
+};
+
+const markYotoTranscodeReady = async (storyCardId, storyId, story, upload = {}) => {
+  const now = new Date().toISOString();
+  const transcodedSha256 = String(
+    upload.transcodedSha256 || upload.yotoTrackId || getTranscodedSha256FromStory(upload) || getTranscodedSha256FromStory(story)
+  ).trim().replace(/^yoto:#/, "");
+  const yotoTrackUrl = transcodedSha256 ? `yoto:#${transcodedSha256}` : upload.yotoTrackUrl || story.yotoTrackUrl || "";
+  const details = getSafeUploadDetails({
+    ...upload,
+    step: "Waiting on Yoto",
+    yotoUploadStatus: "uploaded",
+    yotoTranscodeStatus: "ready",
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: Number(story.yotoTranscodePollCount || 0) + 1,
+    transcodedSha256,
+  }, story);
+
+  await addActivityLogEntry({
+    level: "info",
+    storyCardId,
+    storyId,
+    eventType: "story_transcode_ready",
+    title: "Story sent",
+    message: "Yoto finished getting this story ready.",
+    details,
+  });
+
+  return updateQueuedStoryFields(storyCardId, storyId, {
+    status: "uploaded",
+    yotoUploadStatus: "uploaded",
+    yotoUploadId: upload.yotoUploadId || story.yotoUploadId || "",
+    transcodedSha256,
+    yotoTrackId: transcodedSha256 || upload.yotoTrackId || story.yotoTrackId || "",
+    yotoTrackUrl,
+    yotoTranscodeStatus: "ready",
+    yotoTranscodeRetryAfter: "",
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: Number(story.yotoTranscodePollCount || 0) + 1,
+    yotoDuration: upload.yotoDuration || story.yotoDuration || 0,
+    yotoFileSize: upload.yotoFileSize || story.yotoFileSize || story.fileSize || 0,
+    yotoFormat: upload.yotoFormat || story.yotoFormat || getYotoFormatFromStory(story),
+    yotoChannels: upload.yotoChannels || story.yotoChannels || "",
+    uploadedAt: story.uploadedAt || now,
+    uploadError: "",
+    playlistUpdateStatus: "",
+    playlistUpdateError: "",
+    playlistUpdateRetryAfter: "",
+    playlistUpdateFailureType: "",
+  });
+};
+
+const markYotoTranscodeFailed = async (storyCardId, storyId, story, message, details = {}) => {
+  const now = new Date().toISOString();
+  const safeDetails = getSafeUploadDetails({
+    ...details,
+    step: "Waiting on Yoto",
+    yotoUploadStatus: "failed",
+    yotoTranscodeStatus: "failed",
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: Number(details.yotoTranscodePollCount || story.yotoTranscodePollCount || 0) + 1,
+  }, story);
+
+  await addActivityLogEntry({
+    level: "error",
+    storyCardId,
+    storyId,
+    eventType: "story_transcode_failed",
+    title: "Story needs help",
+    message,
+    details: safeDetails,
+  });
+
+  return updateQueuedStoryFields(storyCardId, storyId, {
+    status: "failed",
+    yotoUploadStatus: "failed",
+    yotoTranscodeStatus: "failed",
+    yotoTranscodeRetryAfter: "",
+    yotoTranscodeLastCheckedAt: now,
+    yotoTranscodePollCount: safeDetails.yotoTranscodePollCount,
+    uploadError: message,
+    playlistUpdateStatus: "failed",
+    playlistUpdateError: message,
+    playlistUpdateRetryAfter: "",
+    playlistUpdateFailureType: "yoto_processing",
+  });
+};
+
+const checkYotoTranscodeStatusForStory = async (storyCardId, storyId, { poll = false } = {}) => {
+  const story = await getQueuedStoryById(storyCardId, storyId);
+  if (!story) throw createExposedError("Story not found.", 404);
+  if (hasUsableYotoTrackMetadata(story)) return story;
+
+  if (!story.yotoUploadId) {
+    return markYotoTranscodeFailed(storyCardId, storyId, story,
+      "Feed Your Yoto could not find the Yoto upload for this story.",
+      {
+        technicalMessage: "Story had no uploadId to check transcode status.",
+        yotoUploadStatus: "failed",
+        yotoTranscodeStatus: "failed",
+      }
+    );
+  }
+
+  try {
+    const upload = await pollYotoUploadIfNeeded(getStoredYotoUploadForStory(story), story, {
+      maxAttempts: poll ? YOTO_TRANSCODE_MAX_ATTEMPTS : 1,
+      intervalMs: poll ? YOTO_TRANSCODE_POLL_INTERVAL_MS : 0,
+    });
+    return markYotoTranscodeReady(storyCardId, storyId, story, upload);
+  } catch (error) {
+    const details = getSafeUploadDetails(error, story);
+    if (isYotoProcessingError(details)) {
+      return markYotoTranscodeWaiting(storyCardId, storyId, story, details);
+    }
+
+    const message = error.expose ? error.message : "Yoto could not get this story ready.";
+    return markYotoTranscodeFailed(storyCardId, storyId, story, message, details);
+  }
+};
+
+const ensureYotoTrackMetadataForStory = async (storyCardId, story) => {
+  if (hasUsableYotoTrackMetadata(story)) return story;
+  if (!story.yotoUploadId) return story;
+  return checkYotoTranscodeStatusForStory(storyCardId, story.id);
+};
+
+const getYotoPlaylistCardFromResponse = (data) => data?.card || data;
+
+const getYotoPlaylistContent = async (storyCard) => {
+  const playlistId = String(storyCard.yotoPlaylistId || "").trim();
+  if (!playlistId) {
+    throw createYotoPlaylistUpdateError("Feed Your Yoto could not find this Story Playlist.", 404, {
+      step: "Finding Story Playlist",
+      failureType: "playlist_not_found",
+      yotoPlaylistId: playlistId,
+      technicalMessage: "Story Card did not include a selected Yoto playlist id.",
+    }, storyCard);
+  }
+
+  let tokens = await getAuthenticatedTokens();
+  if (!tokens) {
+    throw createYotoPlaylistUpdateError("Feed Your Yoto needs to reconnect to Yoto.", 401, {
+      step: "Finding Story Playlist",
+      failureType: "yoto_auth",
+      yotoPlaylistId: playlistId,
+      technicalMessage: "No authenticated Yoto access token was available.",
+    }, storyCard);
+  }
+
+  try {
+    const response = await getYotoJsonWithRefresh(`/content/${encodeURIComponent(playlistId)}`, tokens);
+    const card = getYotoPlaylistCardFromResponse(response.data);
+
+    if (!card?.cardId && !card?.id && !card?._id) {
+      throw createYotoPlaylistUpdateError("Feed Your Yoto could not find this Story Playlist.", 404, {
+        step: "Finding Story Playlist",
+        failureType: "playlist_not_found",
+        yotoPlaylistId: playlistId,
+        technicalMessage: "Yoto content response did not include a card object.",
+      }, storyCard);
+    }
+
+    if (card.deleted === true || hasStreamingMedia(card)) {
+      throw createYotoPlaylistUpdateError("Feed Your Yoto could not update this Story Playlist safely.", 400, {
+        step: "Checking Story Playlist",
+        failureType: "playlist_payload_error",
+        yotoPlaylistId: playlistId,
+        technicalMessage: card.deleted === true
+          ? "Selected Yoto content is deleted."
+          : "Selected Yoto content contains streaming media.",
+      }, storyCard);
+    }
+
+    return { card, tokens: response.tokens };
+  } catch (error) {
+    if (error.expose) throw error;
+    const notFound = error.status === 404;
+    const authProblem = error.status === 401 || error.status === 403;
+    throw createYotoPlaylistUpdateError(
+      notFound
+        ? "Feed Your Yoto could not find this Story Playlist."
+        : authProblem
+          ? "Feed Your Yoto needs to reconnect to Yoto."
+          : "Feed Your Yoto could not update this Story Playlist right now.",
+      notFound ? 404 : authProblem ? 401 : 502,
+      {
+        step: "Finding Story Playlist",
+        failureType: notFound ? "playlist_not_found" : authProblem ? "yoto_auth" : classifyPlaylistFailure(error),
+        yotoPlaylistId: playlistId,
+        httpStatus: error.status,
+        technicalMessage: error.data?.message || error.data?.error || error.message,
+      },
+      storyCard
+    );
+  }
+};
+
+const formatYotoTrackKey = (index) => String(index + 1).padStart(2, "0");
+
+const getMissingYotoTrackMetadataFields = (story = {}) => {
+  const missing = [];
+  if (!String(story.title || "").trim()) missing.push("title");
+  if (!getTranscodedSha256FromStory(story)) missing.push("transcodedSha256");
+  if (!getYotoTrackUrlFromStory(story)) missing.push("yotoTrackUrl");
+  if (!Number(story.yotoFileSize || story.fileSize || 0)) missing.push("fileSize");
+  if (!getYotoFormatFromStory(story)) missing.push("format");
+  return missing;
+};
+
+const buildYotoPlaylistTrackFromStory = (story, index) => {
+  const missingMetadataFields = getMissingYotoTrackMetadataFields(story);
+  if (missingMetadataFields.length) {
+    throw createYotoPlaylistUpdateError("Feed Your Yoto could not build playlist tracks from the uploaded stories.", 400, {
+      step: "Building Story Playlist",
+      failureType: "playlist_payload_error",
+      storyIdsAttempted: [story.id],
+      missingMetadataFields,
+      uploadTrackMetadata: [{ ...story, missingMetadataFields }],
+      technicalMessage: `Story was missing required Yoto track metadata: ${missingMetadataFields.join(", ")}.`,
+    });
+  }
+
+  const key = formatYotoTrackKey(index);
+  const track = {
+    key,
+    title: String(story.title || "Untitled story").trim(),
+    trackUrl: getYotoTrackUrlFromStory(story),
+    overlayLabel: String(index + 1),
+    duration: Number(story.yotoDuration || 0),
+    fileSize: Number(story.yotoFileSize || story.fileSize || 0),
+    format: getYotoFormatFromStory(story),
+    type: "audio",
+    display: {
+      icon16x16: null,
+    },
+  };
+
+  const channels = getNormalizedYotoChannels(story.yotoChannels);
+  if (channels) track.channels = channels;
+  return track;
+};
+
+const buildYotoPlaylistTracksFromStories = (stories = []) => {
+  const tracks = [];
+  const readyStories = [];
+  const skippedStories = [];
+
+  stories.forEach((story) => {
+    const missingMetadataFields = getMissingYotoTrackMetadataFields(story);
+    if (missingMetadataFields.length) {
+      skippedStories.push({ ...story, missingMetadataFields });
+      return;
+    }
+
+    const track = buildYotoPlaylistTrackFromStory(story, tracks.length);
+    tracks.push(track);
+    readyStories.push(story);
+  });
+
+  return { tracks, readyStories, skippedStories };
+};
+
+const buildYotoPlaylistChapters = (currentCard, storyCard, tracks) => {
+  const existingChapters = asArray(currentCard?.content?.chapters).filter(
+    (chapter) => chapter && typeof chapter === "object"
+  );
+  const chapterTemplate = existingChapters[0] || {};
+  const display = chapterTemplate.display && typeof chapterTemplate.display === "object"
+    ? chapterTemplate.display
+    : { icon16x16: null };
+
+  return [
+    {
+      ...chapterTemplate,
+      key: String(chapterTemplate.key || "01"),
+      title: String(chapterTemplate.title || storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist"),
+      overlayLabel: String(chapterTemplate.overlayLabel || "1"),
+      display,
+      tracks,
+    },
+  ];
+};
+
+const buildYotoPlaylistUpdatePayload = (currentCard, storyCard, tracks) => {
+  const content = currentCard.content && typeof currentCard.content === "object"
+    ? { ...currentCard.content }
+    : {};
+  content.chapters = buildYotoPlaylistChapters(currentCard, storyCard, tracks);
+  if (!content.playbackType) content.playbackType = "linear";
+  if (!content.config) content.config = { resumeTimeout: 2592000 };
+
+  const payload = {
+    cardId: currentCard.cardId || storyCard.yotoPlaylistId,
+    title: currentCard.title || storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist",
+    metadata: currentCard.metadata && typeof currentCard.metadata === "object" ? currentCard.metadata : {},
+    content,
+  };
+
+  ["createdAt", "deleted", "updatedAt", "userId"].forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(currentCard, field)) payload[field] = currentCard[field];
+  });
+
+  return payload;
+};
+
+const getYotoPlaylistTracksFromContent = (card = {}) =>
+  asArray(card?.content?.chapters).flatMap((chapter) =>
+    asArray(chapter?.tracks).map((track) => ({ ...track, chapterKey: chapter?.key || "" }))
+  );
+
+const verifyYotoPlaylistTracks = (card = {}, tracks = []) => {
+  const yotoTracks = getYotoPlaylistTracksFromContent(card);
+  const sentTrackUrls = new Set(tracks.map((track) => String(track.trackUrl || "").trim()).filter(Boolean));
+  const verifiedTracks = yotoTracks.filter((track) => sentTrackUrls.has(String(track.trackUrl || "").trim()));
+  return {
+    yotoTracks,
+    verifiedTracks,
+    verifiedTrackCount: verifiedTracks.length,
+    populatedTrackCount: yotoTracks.filter((track) => String(track.trackUrl || "").startsWith("yoto:#")).length,
+  };
+};
+
+
+const markPlaylistUpdateWaiting = async (storyCardId, stories, storyCard, details = {}) => {
+  const waiting = [];
+  const retryAfter = details.yotoTranscodeRetryAfter || details.playlistUpdateRetryAfter || details.retryAfter || getYotoProcessingRetryAfter();
+  const lastCheckedAt = details.yotoTranscodeLastCheckedAt || new Date().toISOString();
+
+  for (const story of stories) {
+    const safeDetails = getSafePlaylistDetails({
+      ...details,
+      failureType: "yoto_processing",
+      storyIdsAttempted: details.storyIdsAttempted || [story.id],
+      uploadTrackMetadata: details.uploadTrackMetadata || [story],
+      playlistUpdateStatus: "waiting",
+      playlistUpdateRetryAfter: retryAfter,
+      yotoUploadStatus: details.yotoUploadStatus || story.yotoUploadStatus || "processing",
+      yotoTranscodeStatus: details.yotoTranscodeStatus || story.yotoTranscodeStatus || "processing",
+      yotoTranscodeRetryAfter: retryAfter,
+      yotoTranscodeLastCheckedAt: lastCheckedAt,
+      yotoTranscodePollCount: details.yotoTranscodePollCount || story.yotoTranscodePollCount || 0,
+    }, storyCard);
+
+    await addActivityLogEntry({
+      level: "warning",
+      storyCardId,
+      storyId: story.id,
+      eventType: "story_playlist_update_waiting",
+      title: "Yoto is getting story ready",
+      message: YOTO_PROCESSING_MESSAGE,
+      details: safeDetails,
+    });
+
+    waiting.push(await updateQueuedStoryFields(storyCardId, story.id, {
+      status: "uploaded",
+      yotoUploadStatus: story.yotoUploadStatus === "failed" ? "failed" : "processing",
+      yotoTranscodeStatus: details.yotoTranscodeStatus || story.yotoTranscodeStatus || "processing",
+      yotoTranscodeRetryAfter: retryAfter,
+      yotoTranscodeLastCheckedAt: lastCheckedAt,
+      yotoTranscodePollCount: Number(details.yotoTranscodePollCount || story.yotoTranscodePollCount || 0),
+      playlistUpdateStatus: "waiting",
+      playlistUpdateError: YOTO_PROCESSING_MESSAGE,
+      playlistUpdateRetryAfter: retryAfter,
+      playlistUpdateFailureType: "yoto_processing",
+      uploadError: "",
+    }));
+  }
+
+  return waiting;
+};
+
+const markPlaylistUpdateFailed = async (storyCardId, stories, storyCard, message, details = {}) => {
+  const failed = [];
+
+  for (const story of stories) {
+    const safeDetails = getSafePlaylistDetails({
+      ...details,
+      storyIdsAttempted: details.storyIdsAttempted || [story.id],
+      uploadTrackMetadata: details.uploadTrackMetadata || [story],
+      playlistUpdateStatus: "failed",
+    }, storyCard);
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId: story.id,
+      eventType: "story_playlist_update_failed",
+      title: "Story needs help",
+      message,
+      details: safeDetails,
+    });
+    failed.push(await updateQueuedStoryFields(storyCardId, story.id, {
+      status: "failed",
+      uploadError: message,
+      playlistUpdateStatus: "failed",
+      playlistUpdateError: message,
+      playlistUpdateRetryAfter: "",
+      playlistUpdateFailureType: safeDetails.failureType,
+    }));
+  }
+
+  return failed;
+};
+
+const isPlaylistUpdateCandidateStory = (story = {}) => {
+  if (!story || story.storyCardId === undefined) return false;
+  if (["uploaded", "synced"].includes(story.status)) return true;
+  return story.status === "failed" && (hasPendingYotoTranscode(story) || hasUsableYotoTrackMetadata(story));
+};
+
+const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
+  const { storyCard } = await getStoryCardOrThrow(storyCardId);
+  let queuedStories = await getStoryQueueForStoryCard(storyCardId);
+  const preview = getPlaylistPreviewForStoryCard(storyCard, queuedStories);
+  const candidateStories = preview.onYotoSoon.filter(
+    (story) => story.storyCardId === storyCardId && isPlaylistUpdateCandidateStory(story)
+  );
+  const intendedTrackCount = candidateStories.length;
+  const synced = [];
+  const waiting = [];
+  let failed = [];
+
+  if (!candidateStories.length) {
+    return { synced, waiting, failed, stories: queuedStories };
+  }
+
+  const readyStories = [];
+  for (const story of candidateStories) {
+    const currentStory = (await getStoryQueueForStoryCard(storyCardId)).find((item) => item.id === story.id) || story;
+    try {
+      const withTrackMetadata = await ensureYotoTrackMetadataForStory(storyCardId, currentStory);
+      if (hasUsableYotoTrackMetadata(withTrackMetadata)) {
+        readyStories.push(withTrackMetadata);
+      } else if (withTrackMetadata.status === "uploaded" && withTrackMetadata.yotoUploadId) {
+        waiting.push(...(await markPlaylistUpdateWaiting(storyCardId, [withTrackMetadata], storyCard, {
+          step: "Waiting on Yoto",
+          storyCardId,
+          yotoPlaylistId: storyCard.yotoPlaylistId,
+          yotoPlaylistTitle: storyCard.yotoPlaylistTitle,
+          intendedTrackCount,
+          readyTrackCount: readyStories.length,
+          storyIdsAttempted: candidateStories.map((item) => item.id),
+          storyTitlesIncluded: candidateStories.map((item) => item.title),
+          technicalMessage: "Story upload exists, but Yoto has not returned playlist-ready track metadata yet.",
+        })));
+      } else if (withTrackMetadata.status === "uploaded") {
+        const missingMetadataFields = getMissingYotoTrackMetadataFields(withTrackMetadata);
+        failed.push(...(await markPlaylistUpdateFailed(storyCardId, [withTrackMetadata], storyCard,
+          "Feed Your Yoto could not build playlist tracks from the uploaded stories.",
+          {
+            step: "Building Story Playlist",
+            failureType: "playlist_payload_error",
+            storyCardId,
+            yotoPlaylistId: storyCard.yotoPlaylistId,
+            yotoPlaylistTitle: storyCard.yotoPlaylistTitle,
+            intendedTrackCount,
+            readyTrackCount: readyStories.length,
+            storyIdsAttempted: [withTrackMetadata.id],
+            storyTitlesIncluded: [withTrackMetadata.title],
+            missingMetadataFields,
+            uploadTrackMetadata: [{ ...withTrackMetadata, missingMetadataFields }],
+            technicalMessage: "Story did not have usable Yoto track metadata.",
+          }
+        )));
+      }
+    } catch (error) {
+      if (isYotoProcessingError(error) && currentStory.status === "uploaded") {
+        waiting.push(...(await markPlaylistUpdateWaiting(storyCardId, [currentStory], storyCard, {
+          ...error,
+          step: error.step || "Waiting on Yoto",
+          storyCardId,
+          yotoPlaylistId: storyCard.yotoPlaylistId,
+          yotoPlaylistTitle: storyCard.yotoPlaylistTitle,
+          intendedTrackCount,
+          readyTrackCount: readyStories.length,
+          storyIdsAttempted: candidateStories.map((item) => item.id),
+          storyTitlesIncluded: candidateStories.map((item) => item.title),
+        })));
+      } else {
+        const message = error.expose ? error.message : "Feed Your Yoto could not add this story to the Story Playlist.";
+        failed.push(...(await markPlaylistUpdateFailed(storyCardId, [currentStory], storyCard, message, {
+          ...error,
+          intendedTrackCount,
+          readyTrackCount: readyStories.length,
+          storyIdsAttempted: [currentStory.id],
+          storyTitlesIncluded: [currentStory.title],
+        })));
+      }
+    }
+  }
+
+  if (!readyStories.length) {
+    return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
+  }
+
+  const { tracks, readyStories: trackStories, skippedStories } = buildYotoPlaylistTracksFromStories(readyStories);
+  const missingMetadataFields = [...new Set(skippedStories.flatMap((story) => story.missingMetadataFields || []))];
+  const detailsBase = {
+    step: "Adding to Story Playlist",
+    storyCardId,
+    yotoPlaylistId: storyCard.yotoPlaylistId,
+    yotoPlaylistTitle: storyCard.yotoPlaylistTitle,
+    intendedTrackCount,
+    readyTrackCount: readyStories.length,
+    builtTrackCount: tracks.length,
+    trackCount: tracks.length,
+    sentTrackCount: 0,
+    syncedCount: trackStories.filter((story) => story.status !== "synced").length,
+    storyIdsAttempted: trackStories.map((story) => story.id),
+    storyTitlesIncluded: trackStories.map((story) => story.title),
+    missingMetadataFields,
+    uploadTrackMetadata: [...trackStories, ...skippedStories],
+  };
+
+  if (!tracks.length || tracks.length !== readyStories.length || skippedStories.length) {
+    const storiesToFail = skippedStories.length ? skippedStories : readyStories;
+    failed = [
+      ...failed,
+      ...(await markPlaylistUpdateFailed(storyCardId, storiesToFail, storyCard,
+        "Feed Your Yoto could not build playlist tracks from the uploaded stories.",
+        {
+          ...detailsBase,
+          step: "Building Story Playlist",
+          failureType: "playlist_payload_error",
+          technicalMessage: "Built track count did not match uploaded/transcode-ready stories.",
+        }
+      )),
+    ];
+    return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
+  }
+
+  const storiesNeedingPlaylistUpdate = trackStories.filter((story) => story.status !== "synced");
+  if (!storiesNeedingPlaylistUpdate.length) {
+    return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
+  }
+
+  for (const story of storiesNeedingPlaylistUpdate) {
+    await updateQueuedStoryFields(storyCardId, story.id, {
+      status: "adding_to_playlist",
+      playlistUpdateStatus: "adding",
+      playlistUpdateError: "",
+      playlistUpdateRetryAfter: "",
+      playlistUpdateFailureType: "",
+    });
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId: story.id,
+      eventType: "story_playlist_update_started",
+      title: "Adding to Story Playlist",
+      message: "Feed Your Yoto is updating this Story Playlist.",
+      details: getSafePlaylistDetails({ ...detailsBase, playlistUpdateStatus: "adding" }, storyCard),
+    });
+  }
+
+  try {
+    const { card, tokens } = await getYotoPlaylistContent(storyCard);
+    const updatePayload = buildYotoPlaylistUpdatePayload(card, storyCard, tracks);
+    const response = await postYotoJsonWithRefresh("/content", tokens, updatePayload);
+    const responseShape = getSafeYotoResponseShape(response.data);
+    const { card: verifiedCard } = await getYotoPlaylistContent(storyCard);
+    const verification = verifyYotoPlaylistTracks(verifiedCard, tracks);
+    const verifiedResponseShape = getSafeYotoResponseShape(verifiedCard);
+    const verifiedTrackCount = verification.verifiedTrackCount;
+    const finishDetails = getSafePlaylistDetails({
+      ...detailsBase,
+      playlistUpdateStatus: verifiedTrackCount === tracks.length ? "synced" : "failed",
+      sentTrackCount: tracks.length,
+      verifiedTrackCount,
+      httpStatus: 200,
+      responseShape,
+      verifiedResponseShape,
+    }, storyCard);
+
+    if (verifiedTrackCount !== tracks.length || verifiedTrackCount === 0) {
+      const message = "Feed Your Yoto updated the Story Playlist, but Yoto did not show the stories yet.";
+      failed = [
+        ...failed,
+        ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, {
+          ...finishDetails,
+          step: "Adding to Story Playlist",
+          failureType: "playlist_payload_error",
+          technicalMessage: "Playlist verification did not find every sent track URL after update.",
+        })),
+      ];
+      return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
+    }
+
+    for (const story of storiesNeedingPlaylistUpdate) {
+      await addActivityLogEntry({
+        level: "info",
+        storyCardId,
+        storyId: story.id,
+        eventType: "story_playlist_update_finished",
+        title: "Ready on Yoto",
+        message: "This Story Playlist is ready on Yoto.",
+        details: finishDetails,
+      });
+      synced.push(await updateQueuedStoryFields(storyCardId, story.id, {
+        status: "synced",
+        uploadError: "",
+        playlistUpdateStatus: "synced",
+        playlistUpdateError: "",
+        playlistUpdateRetryAfter: "",
+        playlistUpdateFailureType: "",
+      }));
+    }
+  } catch (error) {
+    const details = getSafePlaylistDetails({
+      ...error,
+      ...detailsBase,
+      sentTrackCount: tracks.length,
+      httpStatus: error.httpStatus || error.status,
+      technicalMessage: error.technicalMessage || error.data?.message || error.data?.error || error.message,
+    }, storyCard);
+
+    if (details.failureType === "yoto_processing") {
+      waiting.push(...(await markPlaylistUpdateWaiting(storyCardId, storiesNeedingPlaylistUpdate, storyCard, details)));
+    } else {
+      const message = error.expose ? error.message : "Feed Your Yoto could not update this Story Playlist right now.";
+      failed = [
+        ...failed,
+        ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, details)),
+      ];
+    }
+  }
+
+  return {
+    synced,
+    waiting,
+    failed,
+    stories: await getStoryQueueForStoryCard(storyCardId),
+  };
+};
+
 
 const getCreatedYotoPlaylistId = (data) =>
   data?.card?.cardId || data?.card?.card_id || data?.card?._id || data?.card?.id || data?.cardId || data?.id || "";
@@ -2235,6 +3255,7 @@ const handleApi = async (request, response, pathname) => {
     const storyQueueRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/?$/);
     const storyDiscoverRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/discover\/?$/);
     const playlistPreviewRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/playlist-preview\/?$/);
+    const syncPlaylistRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/sync-playlist\/?$/);
     const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
     const storyUploadReadyRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/upload-ready\/?$/);
@@ -2310,6 +3331,12 @@ const handleApi = async (request, response, pathname) => {
       const { storyCard } = await getStoryCardOrThrow(storyCardId);
       const queuedStories = await getStoryQueueForStoryCard(storyCardId);
       sendJson(response, 200, getPlaylistPreviewForStoryCard(storyCard, queuedStories));
+      return;
+    }
+
+    if (request.method === "POST" && syncPlaylistRoute) {
+      const storyCardId = decodeURIComponent(syncPlaylistRoute[1]);
+      sendJson(response, 200, await updateYotoStoryPlaylistForStoryCard(storyCardId));
       return;
     }
 
