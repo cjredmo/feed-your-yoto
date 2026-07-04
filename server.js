@@ -981,6 +981,7 @@ const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
     playlistUpdateError: String(existingStory.playlistUpdateError || "").trim(),
     playlistUpdateRetryAfter: String(existingStory.playlistUpdateRetryAfter || "").trim(),
     playlistUpdateFailureType: String(existingStory.playlistUpdateFailureType || "").trim(),
+    lastPlaylistSyncAt: String(existingStory.lastPlaylistSyncAt || "").trim(),
     isPinned: Boolean(existingStory.isPinned),
     isSelected: Boolean(existingStory.isSelected),
     isSkipped: Boolean(existingStory.isSkipped),
@@ -1278,6 +1279,14 @@ const isStorySafeForLocalAudioCleanup = (story = {}) =>
   Boolean(story.localFilePath) &&
   story.downloadStatus === "downloaded";
 
+const isStoryActivelyProcessingForCleanup = (story = {}) =>
+  story.status === "downloading" ||
+  story.status === "uploading" ||
+  story.status === "adding_to_playlist" ||
+  story.downloadStatus === "downloading" ||
+  story.yotoUploadStatus === "uploading" ||
+  story.playlistUpdateStatus === "adding";
+
 const getLocalAudioCleanupSkipReason = (story = {}) => {
   if (!story) return "Story was not found.";
   if (story.status !== "synced") return "Story is not Ready on Yoto yet.";
@@ -1385,6 +1394,19 @@ const cleanupSyncedStoryAudioForStoryCard = async (storyCardId) => {
   const cleaned = [];
   const skipped = [];
   const failed = [];
+  const activeStory = cardStories.find(isStoryActivelyProcessingForCleanup);
+
+  if (activeStory) {
+    return {
+      cleaned,
+      skipped: cardStories.map((story) => ({
+        storyId: story.id,
+        reason: "Cleanup waits until story preparation and playlist updates are finished.",
+      })),
+      failed,
+      stories: await getStoryQueueForStoryCard(storyCardId),
+    };
+  }
 
   for (const story of cardStories) {
     if (!isStorySafeForLocalAudioCleanup(story)) {
@@ -3181,7 +3203,8 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
   let failed = [];
 
   if (!candidateStories.length) {
-    return { synced, waiting, failed, stories: queuedStories };
+    const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+    return { synced, waiting, failed, stories: cleanupResult.stories };
   }
 
   const readyStories = [];
@@ -3291,7 +3314,8 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
 
   const storiesNeedingPlaylistUpdate = trackStories.filter((story) => story.status !== "synced");
   if (!storiesNeedingPlaylistUpdate.length) {
-    return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
+    const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+    return { synced, waiting, failed, stories: cleanupResult.stories };
   }
 
   for (const story of storiesNeedingPlaylistUpdate) {
