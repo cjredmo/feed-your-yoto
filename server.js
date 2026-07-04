@@ -32,8 +32,7 @@ const YOTO_PLAYLIST_PROCESSING_RETRY_MS = 2 * 60 * 1000;
 const YOTO_TRANSCODE_MAX_RETRY_WINDOWS = 30;
 const AUTOMATIC_SCHEDULER_START_DELAY_MS = 15_000;
 const AUTOMATIC_SCHEDULER_INTERVAL_MS = 15 * 60 * 1000;
-const AUTOMATIC_SCHEDULER_MIN_RETRY_MS = 60 * 60 * 1000;
-const AUTOMATIC_SCHEDULER_DAILY_RETRY_MS = 24 * 60 * 60 * 1000;
+const AUTOMATIC_STORY_CARD_INTERVAL_MS = 60 * 60 * 1000;
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
 const MISSING_AUDIO_DOWNLOAD_MESSAGE =
   "This story can't be downloaded because it is missing its download link in the RSS feed.";
@@ -151,7 +150,9 @@ const readRequestJson = (request) =>
 
 const readStoryCards = async () => {
   const storyCards = await readJsonFile(await getStoryCardsPath());
-  return Array.isArray(storyCards) ? storyCards.map(withStoryQueueRuleDefaults) : [];
+  return Array.isArray(storyCards)
+    ? storyCards.map(withStoryQueueRuleDefaults).map(withAutomaticStoryCardDefaults)
+    : [];
 };
 
 const writeStoryCards = async (storyCards) => {
@@ -552,45 +553,53 @@ const toIsoString = (value) => {
   return date ? date.toISOString() : "";
 };
 
-const addCalendarMonths = (date, months) => {
-  const next = new Date(date);
-  const originalDay = next.getDate();
-  next.setMonth(next.getMonth() + months);
+const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
 
-  if (next.getDate() !== originalDay) {
-    next.setDate(0);
-  }
+const isAutomaticChecksEnabled = (storyCard = {}) => {
+  if (hasOwn(storyCard, "automaticChecksEnabled")) return storyCard.automaticChecksEnabled !== false;
+  return String(storyCard.updateRhythm || "").trim() !== "manual";
+};
 
-  return next;
+const normalizeAutomaticChecksEnabled = (body = {}, existingCard = {}) => {
+  if (hasOwn(body, "automaticChecksEnabled")) return body.automaticChecksEnabled !== false;
+  if (hasOwn(existingCard, "automaticChecksEnabled")) return existingCard.automaticChecksEnabled !== false;
+
+  const rhythm = String(body.updateRhythm || existingCard.updateRhythm || "").trim();
+  return rhythm !== "manual";
 };
 
 const getNextAutomaticCheckAt = (storyCard = {}, fromDate = new Date()) => {
+  if (!isAutomaticChecksEnabled(storyCard)) return "";
+
   const from = parseDate(fromDate) || new Date();
-  const rhythm = storyCard.updateRhythm || "manual";
-  const next = new Date(from);
-
-  if (rhythm === "daily") {
-    next.setDate(next.getDate() + 1);
-  } else if (rhythm === "weekly") {
-    next.setDate(next.getDate() + 7);
-  } else if (rhythm === "monthly") {
-    return addCalendarMonths(next, 1).toISOString();
-  } else {
-    return "";
-  }
-
+  const next = new Date(from.getTime() + AUTOMATIC_STORY_CARD_INTERVAL_MS);
   return next.toISOString();
 };
 
-const getAutomaticRetryDelayMs = (storyCard = {}) => {
-  if (storyCard.lateCheckRhythm === "daily") return AUTOMATIC_SCHEDULER_DAILY_RETRY_MS;
-  return AUTOMATIC_SCHEDULER_MIN_RETRY_MS;
+const withAutomaticStoryCardDefaults = (storyCard = {}) => {
+  const automaticChecksEnabled = isAutomaticChecksEnabled(storyCard);
+  const lastAutomaticCheckAt = toIsoString(storyCard.lastAutomaticCheckAt);
+
+  return {
+    ...storyCard,
+    automaticChecksEnabled,
+    updateRhythm: automaticChecksEnabled
+      ? String(storyCard.updateRhythm || "daily").trim() || "daily"
+      : "manual",
+    lateCheckRhythm: automaticChecksEnabled
+      ? String(storyCard.lateCheckRhythm || "hourly").trim() || "hourly"
+      : "",
+    lastAutomaticCheckAt,
+    nextAutomaticCheckAt: !automaticChecksEnabled
+      ? ""
+      : lastAutomaticCheckAt
+        ? getNextAutomaticCheckAt({ ...storyCard, automaticChecksEnabled }, lastAutomaticCheckAt)
+        : toIsoString(storyCard.nextAutomaticCheckAt),
+  };
 };
 
 const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
   const errors = [];
-  const updateRhythm = String(body.updateRhythm || "").trim();
-  const lateCheckRhythm = String(body.lateCheckRhythm || "").trim();
 
   if (!String(body.name || "").trim()) errors.push("Story Card Name is required.");
   if (!String(body.podcastLink || "").trim()) errors.push("Podcast Link is required.");
@@ -600,10 +609,6 @@ const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
   if (requirePlaylist && !String(body.yotoPlaylistId || "").trim()) {
     errors.push("Choose a Story Playlist first.");
   }
-  if (!updateRhythm) errors.push("Choose when this Story Card should check for episodes.");
-  if (updateRhythm !== "manual" && !lateCheckRhythm) {
-    errors.push("Choose what to do if the episode is late.");
-  }
 
   if (errors.length) {
     throw createExposedError(errors[0]);
@@ -612,7 +617,11 @@ const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
 
 const normalizeStoryCard = (body, existingCard = {}) => {
   const now = new Date().toISOString();
-  const updateRhythm = String(body.updateRhythm || existingCard.updateRhythm || "").trim();
+  const automaticChecksEnabled = normalizeAutomaticChecksEnabled(body, existingCard);
+  const updateRhythm = String(
+    body.updateRhythm || existingCard.updateRhythm || (automaticChecksEnabled ? "daily" : "manual")
+  ).trim();
+  const legacyRhythm = automaticChecksEnabled && updateRhythm === "manual" ? "daily" : updateRhythm;
 
   return {
     id: existingCard.id,
@@ -646,11 +655,12 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     yotoPlaylistImageUrl: isHttpUrl(body.yotoPlaylistImageUrl)
       ? body.yotoPlaylistImageUrl
       : null,
-    updateRhythm,
-    lateCheckRhythm: updateRhythm === "manual" ? "" : String(body.lateCheckRhythm || "").trim(),
+    updateRhythm: legacyRhythm,
+    lateCheckRhythm: automaticChecksEnabled ? String(body.lateCheckRhythm || existingCard.lateCheckRhythm || "hourly").trim() : "",
+    automaticChecksEnabled,
     status: String(body.status || existingCard.status || "Updating").trim(),
     statusType: String(body.statusType || existingCard.statusType || "live").trim(),
-    nextCheck: updateRhythm === "manual" ? "" : String(body.nextCheck || "").trim(),
+    nextCheck: automaticChecksEnabled ? String(body.nextCheck || "").trim() : "",
     newStoryBehavior: normalizeNewStoryBehavior(
       body.newStoryBehavior ?? existingCard.newStoryBehavior
     ),
@@ -661,7 +671,7 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     lastAutomaticCheckAt: toIsoString(
       body.lastAutomaticCheckAt ?? existingCard.lastAutomaticCheckAt
     ),
-    nextAutomaticCheckAt: updateRhythm === "manual"
+    nextAutomaticCheckAt: !automaticChecksEnabled
       ? ""
       : toIsoString(body.nextAutomaticCheckAt ?? existingCard.nextAutomaticCheckAt),
     lastAutomaticResult: String(
@@ -771,15 +781,17 @@ const updateStoryCard = async (id, body) => {
   };
 
   const scheduleChanged =
-    Object.prototype.hasOwnProperty.call(body, "updateRhythm") ||
-    Object.prototype.hasOwnProperty.call(body, "nextCheck") ||
-    Object.prototype.hasOwnProperty.call(body, "lateCheckRhythm");
+    hasOwn(body, "automaticChecksEnabled") ||
+    hasOwn(body, "updateRhythm") ||
+    hasOwn(body, "nextCheck") ||
+    hasOwn(body, "lateCheckRhythm");
 
   if (scheduleChanged && !Object.prototype.hasOwnProperty.call(body, "nextAutomaticCheckAt")) {
+    const automaticChecksEnabled = normalizeAutomaticChecksEnabled(merged, storyCards[index]);
     merged.nextAutomaticCheckAt =
-      merged.updateRhythm === "manual"
+      !automaticChecksEnabled
         ? ""
-        : String(merged.nextCheck || "").trim() || getNextAutomaticCheckAt(merged, new Date());
+        : getNextAutomaticCheckAt({ ...merged, automaticChecksEnabled }, new Date());
   }
 
   validateStoryCardInput(merged);
@@ -1531,7 +1543,9 @@ const cleanupSyncedStoryAudioForStoryCard = async (storyCardId) => {
 
 const getAutomaticStoryCardSkipReason = (storyCard = {}, { ignoreSchedule = false } = {}) => {
   if (!storyCard?.id) return "Story Card was not found.";
-  if (!ignoreSchedule && storyCard.updateRhythm === "manual") return "Automatic checks are off for this Story Card.";
+  if (!ignoreSchedule && !isAutomaticChecksEnabled(storyCard)) {
+    return "Automatic checks are off for this Story Card.";
+  }
   if (
     !ignoreSchedule &&
     (storyCard.statusType === "paused" || String(storyCard.status || "").toLowerCase().includes("break"))
@@ -1547,13 +1561,8 @@ const getAutomaticDueStatus = (storyCard = {}, now = new Date()) => {
   const skipReason = getAutomaticStoryCardSkipReason(storyCard);
   if (skipReason) return { due: false, reason: skipReason, skipped: true };
 
-  const nextCheck = parseDate(storyCard.nextAutomaticCheckAt) || parseDate(storyCard.nextCheck);
-  if (nextCheck && nextCheck.getTime() > now.getTime()) {
-    return { due: false, reason: "Not due yet.", skipped: false };
-  }
-
   const lastCheck = parseDate(storyCard.lastAutomaticCheckAt);
-  if (lastCheck && now.getTime() - lastCheck.getTime() < getAutomaticRetryDelayMs(storyCard)) {
+  if (lastCheck && now.getTime() - lastCheck.getTime() < AUTOMATIC_STORY_CARD_INTERVAL_MS) {
     return { due: false, reason: "Checked recently.", skipped: false };
   }
 
@@ -1562,8 +1571,7 @@ const getAutomaticDueStatus = (storyCard = {}, now = new Date()) => {
 
 const getSafeAutomaticDetails = (storyCard = {}, extras = {}) => ({
   storyCardId: String(storyCard.id || extras.storyCardId || "").trim(),
-  updateRhythm: String(storyCard.updateRhythm || extras.updateRhythm || "").trim(),
-  lateCheckRhythm: String(storyCard.lateCheckRhythm || extras.lateCheckRhythm || "").trim(),
+  automaticChecksEnabled: extras.automaticChecksEnabled ?? isAutomaticChecksEnabled(storyCard),
   lastAutomaticCheckAt: toIsoString(extras.lastAutomaticCheckAt || storyCard.lastAutomaticCheckAt),
   nextAutomaticCheckAt: toIsoString(extras.nextAutomaticCheckAt || storyCard.nextAutomaticCheckAt),
   discoveredCount: Number(extras.discoveredCount || 0),
@@ -1654,8 +1662,16 @@ const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
       failedCount: 0,
     };
 
+    const storiesBeforeDiscovery = await getStoryQueueForStoryCard(storyCardId);
+    const storyIdsBeforeDiscovery = new Set(storiesBeforeDiscovery.map((story) => story.id));
     const discoveredStories = await discoverStoriesForStoryCard(storyCardId);
-    addCount(summary, "discoveredCount", Array.isArray(discoveredStories) ? discoveredStories.length : 0);
+    addCount(
+      summary,
+      "discoveredCount",
+      Array.isArray(discoveredStories)
+        ? discoveredStories.filter((story) => !storyIdsBeforeDiscovery.has(story.id)).length
+        : 0
+    );
 
     const downloadResult = await downloadSelectedStories(storyCardId);
     addCount(summary, "downloadedCount", downloadResult.downloaded?.length);
@@ -1675,8 +1691,16 @@ const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
     addCount(summary, "cleanedCount", cleanupResult.cleaned?.length);
     addCount(summary, "failedCount", cleanupResult.failed?.length);
 
+    const progressCount =
+      summary.discoveredCount +
+      summary.downloadedCount +
+      summary.uploadedCount +
+      summary.syncedCount +
+      summary.cleanedCount;
     const result = summary.failedCount ? "failed" : summary.waitingCount ? "waiting" : "success";
-    const message = getAutomaticResultMessage(result);
+    const message = result === "success" && !progressCount
+      ? "No new stories were found."
+      : getAutomaticResultMessage(result);
     const finishedAt = new Date();
     const finishedNextAutomaticCheckAt = getNextAutomaticCheckAt(storyCard, finishedAt);
     const finishedCard = await updateStoryCardAutomaticState(storyCardId, {

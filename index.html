@@ -207,34 +207,10 @@
           </div>
 
           <div id="schedulePanel" class="editor-panel" role="tabpanel" aria-labelledby="scheduleTab" data-editor-panel="schedule" hidden>
-            <label class="field">
-              <span>Next Check</span>
-              <input id="nextCrawl" type="datetime-local" value="2026-06-28T19:30" />
-            </label>
-
-            <div class="control-group" aria-labelledby="frequencyLabel">
-              <p id="frequencyLabel">Look for new episodes</p>
-              <div class="segmented-control">
-                <button class="segment is-selected" type="button" data-frequency="daily">Every day</button>
-                <button class="segment" type="button" data-frequency="weekly">Every week</button>
-                <button class="segment" type="button" data-frequency="monthly">Every month</button>
-                <button class="segment" type="button" data-frequency="manual">Only when I press check</button>
-              </div>
-            </div>
-
-            <div class="control-group" aria-labelledby="lateFrequencyLabel">
-              <p id="lateFrequencyLabel">If the new episode is late</p>
-              <div class="segmented-control late-check-control">
-                <button class="segment is-selected" type="button" data-late-frequency="hourly">Keep checking every hour</button>
-                <button class="segment" type="button" data-late-frequency="daily">Keep checking once a day</button>
-                <button class="segment" type="button" data-late-frequency="next">Wait until next time</button>
-              </div>
-            </div>
-
             <div class="switch-row">
               <div>
-                <p>Keep Updated</p>
-                <span id="switchStatus">On and watching</span>
+                <p>Automatic checks</p>
+                <span id="switchStatus">Feed Your Yoto checks this Podcast Link every hour.</span>
               </div>
               <button id="syncSwitch" class="sync-switch is-on" type="button" aria-pressed="true">
                 <span></span>
@@ -334,7 +310,7 @@
         <div class="setup-progress" aria-label="Setup steps">
           <span class="setup-step is-active" data-step-indicator="0">1. Pick a Story Playlist</span>
           <span class="setup-step" data-step-indicator="1">2. Add a podcast link</span>
-          <span class="setup-step" data-step-indicator="2">3. Choose when to check</span>
+          <span class="setup-step" data-step-indicator="2">3. Automatic checks</span>
         </div>
 
         <div id="setupStepContent" class="setup-content"></div>

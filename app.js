@@ -68,19 +68,6 @@ const defaultStoryRules = {
   favoritesNeverRotate: true,
 };
 
-const updateRhythmOptions = [
-  { value: "daily", label: "Every day" },
-  { value: "weekly", label: "Every week" },
-  { value: "monthly", label: "Every month" },
-  { value: "manual", label: "Only when I press check" },
-];
-
-const lateCheckRhythmOptions = [
-  { value: "hourly", label: "Keep checking every hour", shortLabel: "if late, checks every hour" },
-  { value: "daily", label: "Keep checking once a day", shortLabel: "if late, checks once a day" },
-  { value: "next", label: "Wait until next time", shortLabel: "if late, waits until next time" },
-];
-
 const cardGrid = document.querySelector("#cardGrid");
 const storyCardsNav = document.querySelector("#storyCardsNav");
 const activityLogNav = document.querySelector("#activityLogNav");
@@ -127,7 +114,6 @@ const automaticScheduleStatus = document.querySelector("#automaticScheduleStatus
 const playlistName = document.querySelector("#playlistName");
 const rssFeed = document.querySelector("#rssFeed");
 const yotoCard = document.querySelector("#yotoCard");
-const nextCrawl = document.querySelector("#nextCrawl");
 const changeSetupDetails = document.querySelector("#changeSetupDetails");
 const setupDetailsPanel = document.querySelector("#setupDetailsPanel");
 const setupChangeAcknowledged = document.querySelector("#setupChangeAcknowledged");
@@ -146,8 +132,6 @@ const switchStatus = document.querySelector("#switchStatus");
 const refreshStories = document.querySelector("#refreshStories");
 const storyQueueContent = document.querySelector("#storyQueueContent");
 const favoritesNeverRotate = document.querySelector("#favoritesNeverRotate");
-const frequencyButtons = Array.from(document.querySelectorAll("[data-frequency]"));
-const lateFrequencyButtons = Array.from(document.querySelectorAll("[data-late-frequency]"));
 const newStoryBehaviorButtons = Array.from(document.querySelectorAll("[data-new-story-behavior]"));
 const editorTabs = Array.from(document.querySelectorAll("[data-editor-tab]"));
 const editorPanels = Array.from(document.querySelectorAll("[data-editor-panel]"));
@@ -177,6 +161,7 @@ function getFreshSetupDraft() {
     podcastPreviewStatus: "idle",
     podcastPreviewMessage: "",
     podcastPreviewLink: "",
+    automaticChecksEnabled: true,
     updateRhythm: "daily",
     lateCheckRhythm: "hourly",
   };
@@ -442,12 +427,19 @@ const getStoryCardPlaylistImageUrl = (storyCard) =>
   storyCard?.yotoPlaylistImageUrl || storyCard?.yotoCardImageUrl || null;
 
 const getStoryCardNextCheckLabel = (storyCard) => {
-  if (storyCard?.updateRhythm === "manual") return "Only when I press check";
-  return formatDateTime(storyCard?.nextCheck);
+  if (!isAutomaticChecksEnabled(storyCard)) return "Only when I press Refresh Stories";
+  return formatDateTime(storyCard?.nextAutomaticCheckAt || storyCard?.nextCheck);
+};
+
+const isAutomaticChecksEnabled = (storyCard = {}) => {
+  if (Object.prototype.hasOwnProperty.call(storyCard, "automaticChecksEnabled")) {
+    return storyCard.automaticChecksEnabled !== false;
+  }
+  return storyCard?.updateRhythm !== "manual";
 };
 
 const getStoryCardAutomaticCheckLabel = (storyCard) => {
-  if (storyCard?.updateRhythm === "manual") return "Only when I press check";
+  if (!isAutomaticChecksEnabled(storyCard)) return "Only when I press Refresh Stories";
   return formatDateTime(storyCard?.nextAutomaticCheckAt || storyCard?.nextCheck);
 };
 
@@ -638,26 +630,19 @@ const canContinueFromPlaylistStep = () => {
   );
 };
 
-const getRhythmLabel = (value) =>
-  updateRhythmOptions.find((option) => option.value === value)?.label || "Every day";
-
-const getLateLabel = (value) =>
-  lateCheckRhythmOptions.find((option) => option.value === value)?.shortLabel ||
-  "if late, checks every hour";
-
 const formatLookSchedule = (storyCard) => {
-  if (storyCard.updateRhythm === "manual") {
-    return getRhythmLabel(storyCard.updateRhythm);
-  }
-
-  return `${getRhythmLabel(storyCard.updateRhythm)} - ${getLateLabel(storyCard.lateCheckRhythm)}`;
+  return isAutomaticChecksEnabled(storyCard)
+    ? "Automatic checks on"
+    : "Only when I press Refresh Stories";
 };
 
 const getNextCheckParts = () => {
   const datedCards = storyCards
     .map((storyCard) => ({
       value: storyCard.nextCheck,
-      date: storyCard.nextCheck ? new Date(storyCard.nextCheck) : null,
+      date: storyCard.nextAutomaticCheckAt || storyCard.nextCheck
+        ? new Date(storyCard.nextAutomaticCheckAt || storyCard.nextCheck)
+        : null,
     }))
     .filter((item) => item.date && !Number.isNaN(item.date.getTime()))
     .sort((first, second) => first.date.getTime() - second.date.getTime());
@@ -807,7 +792,7 @@ function renderCards() {
               <strong>${escapeHtml(getStoryCardNextCheckLabel(storyCard))}</strong>
             </div>
             <div>
-              <span>Looks for episodes</span>
+              <span>Automatic checks</span>
               <strong>${escapeHtml(formatLookSchedule(storyCard))}</strong>
             </div>
           </div>
@@ -817,24 +802,12 @@ function renderCards() {
     .join("");
 }
 
-const setFrequency = (frequency) => {
-  const selectedFrequency = frequency || "daily";
-  frequencyButtons.forEach((button) => {
-    button.classList.toggle("is-selected", button.dataset.frequency === selectedFrequency);
-  });
-};
-
-const setLateFrequency = (frequency) => {
-  const selectedFrequency = frequency || "hourly";
-  lateFrequencyButtons.forEach((button) => {
-    button.classList.toggle("is-selected", button.dataset.lateFrequency === selectedFrequency);
-  });
-};
-
 const setSwitch = (isOn) => {
   syncSwitch.classList.toggle("is-on", isOn);
   syncSwitch.setAttribute("aria-pressed", String(isOn));
-  switchStatus.textContent = isOn ? "On and watching" : "Off for now";
+  switchStatus.textContent = isOn
+    ? "Feed Your Yoto checks this Podcast Link every hour."
+    : "Only check when I press Refresh Stories.";
 };
 
 const setEditorTab = (tabName = "stories") => {
@@ -2223,7 +2196,7 @@ const populateEditorPlaylistOptions = (storyCard) => {
 
 const updateEditorPreview = (storyCard) => {
   const podcastDescription = truncateText(storyCard.podcastDescription, 230);
-  const automaticChecksOn = storyCard.updateRhythm !== "manual" && storyCard.statusType !== "paused";
+  const automaticChecksOn = isAutomaticChecksEnabled(storyCard) && storyCard.statusType !== "paused";
   const automaticResult = getAutomaticResultText(storyCard);
 
   dialogArt.className = "dialog-cover card-picture playlist-card-picture";
@@ -2242,7 +2215,7 @@ const updateEditorPreview = (storyCard) => {
     automaticScheduleStatus.innerHTML = `
       <div>
         <p>${automaticChecksOn ? "Automatic checks are on." : "Automatic checks are off."}</p>
-        <span>Feed Your Yoto checks this Story Card automatically based on its schedule.</span>
+        <span>${automaticChecksOn ? "Checks about once an hour." : "Only check when I press Refresh Stories."}</span>
       </div>
       <dl>
         <div>
@@ -2276,10 +2249,7 @@ const openEditor = (storyCard) => {
   playlistName.value = storyCard.name;
   rssFeed.value = storyCard.podcastLink;
   populateEditorPlaylistOptions(storyCard);
-  nextCrawl.value = storyCard.nextCheck || "";
-  setFrequency(storyCard.updateRhythm);
-  setLateFrequency(storyCard.lateCheckRhythm);
-  setSwitch(storyCard.statusType === "live" || storyCard.statusType === "error");
+  setSwitch(isAutomaticChecksEnabled(storyCard) && storyCard.statusType !== "paused");
   setStoryRules(storyCard);
   setEditorTab("stories");
   setStoriesSubtab("queue");
@@ -2332,28 +2302,21 @@ const saveActiveCard = async () => {
   const activeCard = storyCards.find((storyCard) => storyCard.id === activeCardId);
   if (!activeCard) return;
 
-  const selectedFrequency = frequencyButtons.find((button) =>
-    button.classList.contains("is-selected")
-  );
-  const selectedLateFrequency = lateFrequencyButtons.find((button) =>
-    button.classList.contains("is-selected")
-  );
   const selectedYotoCard = availableYotoCards.find(
     (card) => card.id === yotoCard.value
   );
-  const updateRhythm = selectedFrequency?.dataset.frequency || activeCard.updateRhythm;
+  const automaticChecksEnabled = syncSwitch.classList.contains("is-on");
+  const updateRhythm = automaticChecksEnabled ? "daily" : "manual";
   const previousText = setButtonBusy(saveCard, true, "Saving...");
 
   const storyRules = getEditorStoryRules();
   const updatePayload = {
+    automaticChecksEnabled,
     updateRhythm,
-    lateCheckRhythm:
-      updateRhythm === "manual"
-        ? ""
-        : selectedLateFrequency?.dataset.lateFrequency || activeCard.lateCheckRhythm,
-    status: syncSwitch.classList.contains("is-on") ? "Updating" : "Taking a Break",
-    statusType: syncSwitch.classList.contains("is-on") ? "live" : "paused",
-    nextCheck: updateRhythm === "manual" ? "" : nextCrawl.value,
+    lateCheckRhythm: automaticChecksEnabled ? "hourly" : "",
+    status: automaticChecksEnabled ? "Updating" : "Taking a Break",
+    statusType: automaticChecksEnabled ? "live" : "paused",
+    nextCheck: "",
     newStoryBehavior: storyRules.newStoryBehavior,
     playlistLimit: storyRules.playlistLimit,
     favoritesNeverRotate: storyRules.favoritesNeverRotate,
@@ -2615,35 +2578,20 @@ const renderSetupStep = () => {
     return;
   }
 
-  setupTitle.textContent = "When should we look for new episodes?";
+  setupTitle.textContent = "Automatic checks";
   setupStepContent.innerHTML = `
     <div class="setup-field-stack">
       <div>
-        <p class="setup-label">Add a new episode</p>
+        <p class="setup-label">Automatic checks</p>
         <div class="setup-choice-list">
-          ${updateRhythmOptions
-            .map(
-              (option) => `
-                <button class="setup-choice ${setupDraft.updateRhythm === option.value ? "is-selected" : ""}" type="button" data-update-rhythm="${escapeAttribute(option.value)}">
-                  ${escapeHtml(option.label)}
-                </button>
-              `
-            )
-            .join("")}
-        </div>
-      </div>
-      <div>
-        <p class="setup-label">If the new episode is late</p>
-        <div class="setup-choice-list">
-          ${lateCheckRhythmOptions
-            .map(
-              (option) => `
-                <button class="setup-choice ${setupDraft.lateCheckRhythm === option.value ? "is-selected" : ""}" type="button" data-late-check-rhythm="${escapeAttribute(option.value)}">
-                  ${escapeHtml(option.label)}
-                </button>
-              `
-            )
-            .join("")}
+          <button class="setup-choice ${setupDraft.automaticChecksEnabled ? "is-selected" : ""}" type="button" data-automatic-checks="on">
+            Automatic checks on
+            <span>Feed Your Yoto checks this Podcast Link every hour.</span>
+          </button>
+          <button class="setup-choice ${!setupDraft.automaticChecksEnabled ? "is-selected" : ""}" type="button" data-automatic-checks="off">
+            Automatic checks off
+            <span>Only check when I press Refresh Stories.</span>
+          </button>
         </div>
       </div>
     </div>
@@ -2702,14 +2650,6 @@ const getSetupDraftError = () => {
   const podcastError = validatePodcastLink(setupDraft.podcastLink);
   if (podcastError) return podcastError;
 
-  if (!setupDraft.updateRhythm) {
-    return "Choose when this Story Card should check for episodes.";
-  }
-
-  if (setupDraft.updateRhythm !== "manual" && !setupDraft.lateCheckRhythm) {
-    return "Choose what to do if the episode is late.";
-  }
-
   return "";
 };
 
@@ -2758,20 +2698,8 @@ const goToPreviousSetupStep = () => {
 };
 
 const getNewStoryCardTiming = () => {
-  if (setupDraft.updateRhythm === "manual") {
-    return { label: "Only when I press check", value: "" };
-  }
-
-  const date = new Date();
-  date.setDate(date.getDate() + 1);
-  date.setHours(19, 30, 0, 0);
-
-  return {
-    label: "Tomorrow at 7:30 PM",
-    value: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
-      date.getDate()
-    ).padStart(2, "0")}T19:30`,
-  };
+  if (!setupDraft.automaticChecksEnabled) return { label: "Only when I press Refresh Stories", value: "" };
+  return { label: "Checks about once an hour", value: "" };
 };
 
 const checkPodcastLink = async () => {
@@ -2840,10 +2768,11 @@ const saveSetupStoryCard = async () => {
         setupDraft.playlistMode === "existing"
           ? setupDraft.yotoCardImageUrl || selectedYotoCard?.imageUrl || null
           : null,
-      updateRhythm: setupDraft.updateRhythm,
-      lateCheckRhythm: setupDraft.updateRhythm === "manual" ? "" : setupDraft.lateCheckRhythm,
+      automaticChecksEnabled: setupDraft.automaticChecksEnabled,
+      updateRhythm: setupDraft.automaticChecksEnabled ? "daily" : "manual",
+      lateCheckRhythm: setupDraft.automaticChecksEnabled ? "hourly" : "",
       status: "Updating",
-      statusType: "live",
+      statusType: setupDraft.automaticChecksEnabled ? "live" : "paused",
       nextCheck: timing.value,
       ...getPodcastPreviewPayload(),
     });
@@ -3015,20 +2944,6 @@ cardGrid.addEventListener("click", (event) => {
   if (storyCard) openEditor(storyCard);
 });
 
-frequencyButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    if (!requireAuth("Connect Yoto to change update settings.")) return;
-    setFrequency(button.dataset.frequency);
-  });
-});
-
-lateFrequencyButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    if (!requireAuth("Connect Yoto to change update settings.")) return;
-    setLateFrequency(button.dataset.lateFrequency);
-  });
-});
-
 editorTabs.forEach((tab) => {
   tab.addEventListener("click", () => {
     setEditorTab(tab.dataset.editorTab);
@@ -3175,16 +3090,11 @@ setupStepContent.addEventListener("click", (event) => {
     return;
   }
 
-  const updateRhythmOption = event.target.closest("[data-update-rhythm]");
-  if (updateRhythmOption) {
-    setupDraft.updateRhythm = updateRhythmOption.dataset.updateRhythm;
-    renderSetupStep();
-    return;
-  }
-
-  const lateCheckOption = event.target.closest("[data-late-check-rhythm]");
-  if (lateCheckOption) {
-    setupDraft.lateCheckRhythm = lateCheckOption.dataset.lateCheckRhythm;
+  const automaticChecksOption = event.target.closest("[data-automatic-checks]");
+  if (automaticChecksOption) {
+    setupDraft.automaticChecksEnabled = automaticChecksOption.dataset.automaticChecks === "on";
+    setupDraft.updateRhythm = setupDraft.automaticChecksEnabled ? "daily" : "manual";
+    setupDraft.lateCheckRhythm = setupDraft.automaticChecksEnabled ? "hourly" : "";
     renderSetupStep();
   }
 });

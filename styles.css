@@ -2748,6 +2748,19 @@ h2 {
   font-weight: 900;
 }
 
+.setup-choice span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
+.setup-choice.is-selected span {
+  color: var(--muted);
+}
+
 .setup-actions {
   flex-wrap: wrap;
 }
