@@ -2163,6 +2163,64 @@ h2 {
   font-weight: 900;
 }
 
+.automatic-schedule-status {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 2px solid var(--line);
+  border-left: 6px solid var(--teal);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.automatic-schedule-status:empty {
+  display: none;
+}
+
+.automatic-schedule-status p {
+  margin: 0 0 4px;
+  color: var(--blue-dark);
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.automatic-schedule-status span {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.automatic-schedule-status dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.automatic-schedule-status dl div {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #f7f8fc;
+}
+
+.automatic-schedule-status dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.automatic-schedule-status dd {
+  margin: 0;
+  color: var(--blue-dark);
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1.3;
+}
+
 .delete-confirmation {
   display: flex;
   align-items: center;

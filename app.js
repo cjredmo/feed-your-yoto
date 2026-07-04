@@ -123,6 +123,7 @@ const dialogTitle = document.querySelector("#dialogTitle");
 const dialogStatus = document.querySelector("#dialogStatus");
 const dialogCrawl = document.querySelector("#dialogCrawl");
 const dialogPodcastDescription = document.querySelector("#dialogPodcastDescription");
+const automaticScheduleStatus = document.querySelector("#automaticScheduleStatus");
 const playlistName = document.querySelector("#playlistName");
 const rssFeed = document.querySelector("#rssFeed");
 const yotoCard = document.querySelector("#yotoCard");
@@ -443,6 +444,23 @@ const getStoryCardPlaylistImageUrl = (storyCard) =>
 const getStoryCardNextCheckLabel = (storyCard) => {
   if (storyCard?.updateRhythm === "manual") return "Only when I press check";
   return formatDateTime(storyCard?.nextCheck);
+};
+
+const getStoryCardAutomaticCheckLabel = (storyCard) => {
+  if (storyCard?.updateRhythm === "manual") return "Only when I press check";
+  return formatDateTime(storyCard?.nextAutomaticCheckAt || storyCard?.nextCheck);
+};
+
+const getStoryCardLastAutomaticCheckLabel = (storyCard) =>
+  storyCard?.lastAutomaticCheckAt ? formatDateTime(storyCard.lastAutomaticCheckAt) : "Not yet";
+
+const getAutomaticResultText = (storyCard) => {
+  if (!storyCard?.lastAutomaticResult) return "";
+  if (storyCard.lastAutomaticResult === "success") return "Last check finished.";
+  if (storyCard.lastAutomaticResult === "waiting") return "Waiting on Yoto.";
+  if (storyCard.lastAutomaticResult === "failed") return "Needs help.";
+  if (storyCard.lastAutomaticResult === "skipped") return "Last check was skipped.";
+  return storyCard.lastAutomaticMessage || "";
 };
 
 const getStoryCardArtMarkup = (storyCard) => {
@@ -2205,6 +2223,8 @@ const populateEditorPlaylistOptions = (storyCard) => {
 
 const updateEditorPreview = (storyCard) => {
   const podcastDescription = truncateText(storyCard.podcastDescription, 230);
+  const automaticChecksOn = storyCard.updateRhythm !== "manual" && storyCard.statusType !== "paused";
+  const automaticResult = getAutomaticResultText(storyCard);
 
   dialogArt.className = "dialog-cover card-picture playlist-card-picture";
   dialogArt.innerHTML = getStoryCardArtMarkup(storyCard);
@@ -2216,6 +2236,33 @@ const updateEditorPreview = (storyCard) => {
   if (dialogPodcastDescription) {
     dialogPodcastDescription.textContent = podcastDescription;
     dialogPodcastDescription.hidden = !podcastDescription;
+  }
+
+  if (automaticScheduleStatus) {
+    automaticScheduleStatus.innerHTML = `
+      <div>
+        <p>${automaticChecksOn ? "Automatic checks are on." : "Automatic checks are off."}</p>
+        <span>Feed Your Yoto checks this Story Card automatically based on its schedule.</span>
+      </div>
+      <dl>
+        <div>
+          <dt>Next check</dt>
+          <dd>${escapeHtml(getStoryCardAutomaticCheckLabel(storyCard))}</dd>
+        </div>
+        <div>
+          <dt>Last check</dt>
+          <dd>${escapeHtml(getStoryCardLastAutomaticCheckLabel(storyCard))}</dd>
+        </div>
+        ${
+          automaticResult
+            ? `<div>
+                <dt>Status</dt>
+                <dd>${escapeHtml(automaticResult)}</dd>
+              </div>`
+            : ""
+        }
+      </dl>
+    `;
   }
 };
 

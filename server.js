@@ -30,6 +30,10 @@ const YOTO_TRANSCODE_MAX_ATTEMPTS = 12;
 const YOTO_TRANSCODE_POLL_INTERVAL_MS = 5_000;
 const YOTO_PLAYLIST_PROCESSING_RETRY_MS = 2 * 60 * 1000;
 const YOTO_TRANSCODE_MAX_RETRY_WINDOWS = 30;
+const AUTOMATIC_SCHEDULER_START_DELAY_MS = 15_000;
+const AUTOMATIC_SCHEDULER_INTERVAL_MS = 15 * 60 * 1000;
+const AUTOMATIC_SCHEDULER_MIN_RETRY_MS = 60 * 60 * 1000;
+const AUTOMATIC_SCHEDULER_DAILY_RETRY_MS = 24 * 60 * 60 * 1000;
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
 const MISSING_AUDIO_DOWNLOAD_MESSAGE =
   "This story can't be downloaded because it is missing its download link in the RSS feed.";
@@ -45,6 +49,9 @@ const playlistFailureTypes = new Set([
 ]);
 
 let resolvedDataDir = null;
+let automaticSchedulerTimer = null;
+let automaticSchedulerRunning = false;
+const automaticRunsInProgress = new Set();
 
 const getDataDir = async () => {
   if (resolvedDataDir) return resolvedDataDir;
@@ -535,6 +542,51 @@ const createExposedError = (message, status = 400) => {
   return error;
 };
 
+const parseDate = (value) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const toIsoString = (value) => {
+  const date = parseDate(value);
+  return date ? date.toISOString() : "";
+};
+
+const addCalendarMonths = (date, months) => {
+  const next = new Date(date);
+  const originalDay = next.getDate();
+  next.setMonth(next.getMonth() + months);
+
+  if (next.getDate() !== originalDay) {
+    next.setDate(0);
+  }
+
+  return next;
+};
+
+const getNextAutomaticCheckAt = (storyCard = {}, fromDate = new Date()) => {
+  const from = parseDate(fromDate) || new Date();
+  const rhythm = storyCard.updateRhythm || "manual";
+  const next = new Date(from);
+
+  if (rhythm === "daily") {
+    next.setDate(next.getDate() + 1);
+  } else if (rhythm === "weekly") {
+    next.setDate(next.getDate() + 7);
+  } else if (rhythm === "monthly") {
+    return addCalendarMonths(next, 1).toISOString();
+  } else {
+    return "";
+  }
+
+  return next.toISOString();
+};
+
+const getAutomaticRetryDelayMs = (storyCard = {}) => {
+  if (storyCard.lateCheckRhythm === "daily") return AUTOMATIC_SCHEDULER_DAILY_RETRY_MS;
+  return AUTOMATIC_SCHEDULER_MIN_RETRY_MS;
+};
+
 const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
   const errors = [];
   const updateRhythm = String(body.updateRhythm || "").trim();
@@ -606,6 +658,18 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     favoritesNeverRotate: normalizeFavoritesNeverRotate(
       body.favoritesNeverRotate ?? existingCard.favoritesNeverRotate
     ),
+    lastAutomaticCheckAt: toIsoString(
+      body.lastAutomaticCheckAt ?? existingCard.lastAutomaticCheckAt
+    ),
+    nextAutomaticCheckAt: updateRhythm === "manual"
+      ? ""
+      : toIsoString(body.nextAutomaticCheckAt ?? existingCard.nextAutomaticCheckAt),
+    lastAutomaticResult: String(
+      body.lastAutomaticResult ?? existingCard.lastAutomaticResult ?? ""
+    ).trim(),
+    lastAutomaticMessage: String(
+      body.lastAutomaticMessage ?? existingCard.lastAutomaticMessage ?? ""
+    ).trim(),
     createdAt: existingCard.createdAt || now,
     updatedAt: now,
   };
@@ -705,8 +769,41 @@ const updateStoryCard = async (id, body) => {
     ...storyCards[index],
     ...body,
   };
+
+  const scheduleChanged =
+    Object.prototype.hasOwnProperty.call(body, "updateRhythm") ||
+    Object.prototype.hasOwnProperty.call(body, "nextCheck") ||
+    Object.prototype.hasOwnProperty.call(body, "lateCheckRhythm");
+
+  if (scheduleChanged && !Object.prototype.hasOwnProperty.call(body, "nextAutomaticCheckAt")) {
+    merged.nextAutomaticCheckAt =
+      merged.updateRhythm === "manual"
+        ? ""
+        : String(merged.nextCheck || "").trim() || getNextAutomaticCheckAt(merged, new Date());
+  }
+
   validateStoryCardInput(merged);
   const nextStoryCard = normalizeStoryCard(merged, storyCards[index]);
+  storyCards[index] = nextStoryCard;
+  await writeStoryCards(storyCards);
+  return nextStoryCard;
+};
+
+const updateStoryCardAutomaticState = async (id, fields = {}) => {
+  const storyCards = await readStoryCards();
+  const index = storyCards.findIndex((storyCard) => storyCard.id === id);
+
+  if (index === -1) {
+    throw createExposedError("Story Card not found.", 404);
+  }
+
+  const nextStoryCard = normalizeStoryCard(
+    {
+      ...storyCards[index],
+      ...fields,
+    },
+    storyCards[index]
+  );
   storyCards[index] = nextStoryCard;
   await writeStoryCards(storyCards);
   return nextStoryCard;
@@ -1430,6 +1527,313 @@ const cleanupSyncedStoryAudioForStoryCard = async (storyCardId) => {
     failed,
     stories: await getStoryQueueForStoryCard(storyCardId),
   };
+};
+
+const getAutomaticStoryCardSkipReason = (storyCard = {}, { ignoreSchedule = false } = {}) => {
+  if (!storyCard?.id) return "Story Card was not found.";
+  if (!ignoreSchedule && storyCard.updateRhythm === "manual") return "Automatic checks are off for this Story Card.";
+  if (
+    !ignoreSchedule &&
+    (storyCard.statusType === "paused" || String(storyCard.status || "").toLowerCase().includes("break"))
+  ) {
+    return "This Story Card is taking a break.";
+  }
+  if (!String(storyCard.podcastLink || "").trim()) return "Podcast Link is missing.";
+  if (!String(storyCard.yotoPlaylistId || "").trim()) return "Story Playlist is missing.";
+  return "";
+};
+
+const getAutomaticDueStatus = (storyCard = {}, now = new Date()) => {
+  const skipReason = getAutomaticStoryCardSkipReason(storyCard);
+  if (skipReason) return { due: false, reason: skipReason, skipped: true };
+
+  const nextCheck = parseDate(storyCard.nextAutomaticCheckAt) || parseDate(storyCard.nextCheck);
+  if (nextCheck && nextCheck.getTime() > now.getTime()) {
+    return { due: false, reason: "Not due yet.", skipped: false };
+  }
+
+  const lastCheck = parseDate(storyCard.lastAutomaticCheckAt);
+  if (lastCheck && now.getTime() - lastCheck.getTime() < getAutomaticRetryDelayMs(storyCard)) {
+    return { due: false, reason: "Checked recently.", skipped: false };
+  }
+
+  return { due: true, reason: "", skipped: false };
+};
+
+const getSafeAutomaticDetails = (storyCard = {}, extras = {}) => ({
+  storyCardId: String(storyCard.id || extras.storyCardId || "").trim(),
+  updateRhythm: String(storyCard.updateRhythm || extras.updateRhythm || "").trim(),
+  lateCheckRhythm: String(storyCard.lateCheckRhythm || extras.lateCheckRhythm || "").trim(),
+  lastAutomaticCheckAt: toIsoString(extras.lastAutomaticCheckAt || storyCard.lastAutomaticCheckAt),
+  nextAutomaticCheckAt: toIsoString(extras.nextAutomaticCheckAt || storyCard.nextAutomaticCheckAt),
+  discoveredCount: Number(extras.discoveredCount || 0),
+  downloadedCount: Number(extras.downloadedCount || 0),
+  uploadedCount: Number(extras.uploadedCount || 0),
+  waitingCount: Number(extras.waitingCount || 0),
+  syncedCount: Number(extras.syncedCount || 0),
+  cleanedCount: Number(extras.cleanedCount || 0),
+  failedCount: Number(extras.failedCount || 0),
+});
+
+const addCount = (summary, key, value) => {
+  summary[key] = Number(summary[key] || 0) + Number(value || 0);
+};
+
+const getAutomaticResultMessage = (result) => {
+  if (result === "waiting") return "Feed Your Yoto is waiting on Yoto to finish getting a story ready.";
+  if (result === "failed") return "Automatic check could not finish.";
+  if (result === "skipped") return "Automatic check was skipped.";
+  return "Automatic check finished.";
+};
+
+const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
+  const ignoreSchedule = options.ignoreSchedule === true;
+
+  if (automaticRunsInProgress.has(storyCardId)) {
+    return {
+      result: "skipped",
+      message: "Automatic check is already running for this Story Card.",
+      stories: await getStoryQueueForStoryCard(storyCardId).catch(() => []),
+    };
+  }
+
+  automaticRunsInProgress.add(storyCardId);
+
+  try {
+    let { storyCard } = await getStoryCardOrThrow(storyCardId);
+    const skipReason = getAutomaticStoryCardSkipReason(storyCard, { ignoreSchedule });
+
+    if (skipReason) {
+      const nextAutomaticCheckAt = getNextAutomaticCheckAt(storyCard, new Date());
+      storyCard = await updateStoryCardAutomaticState(storyCardId, {
+        lastAutomaticResult: "skipped",
+        lastAutomaticMessage: skipReason,
+        nextAutomaticCheckAt,
+      });
+      await addActivityLogEntry({
+        level: "info",
+        storyCardId,
+        eventType: "scheduler_skipped",
+        title: "Automatic check skipped",
+        message: skipReason,
+        details: getSafeAutomaticDetails(storyCard, { nextAutomaticCheckAt }),
+      });
+      return {
+        result: "skipped",
+        message: skipReason,
+        stories: await getStoryQueueForStoryCard(storyCardId),
+      };
+    }
+
+    const startedAt = new Date();
+    const nextAutomaticCheckAt = getNextAutomaticCheckAt(storyCard, startedAt);
+    storyCard = await updateStoryCardAutomaticState(storyCardId, {
+      lastAutomaticCheckAt: startedAt.toISOString(),
+      nextAutomaticCheckAt,
+    });
+
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      eventType: "story_card_auto_check_started",
+      title: "Automatic check started",
+      message: "Automatic check started.",
+      details: getSafeAutomaticDetails(storyCard, {
+        lastAutomaticCheckAt: startedAt.toISOString(),
+        nextAutomaticCheckAt,
+      }),
+    });
+
+    const summary = {
+      discoveredCount: 0,
+      downloadedCount: 0,
+      uploadedCount: 0,
+      waitingCount: 0,
+      syncedCount: 0,
+      cleanedCount: 0,
+      failedCount: 0,
+    };
+
+    const discoveredStories = await discoverStoriesForStoryCard(storyCardId);
+    addCount(summary, "discoveredCount", Array.isArray(discoveredStories) ? discoveredStories.length : 0);
+
+    const downloadResult = await downloadSelectedStories(storyCardId);
+    addCount(summary, "downloadedCount", downloadResult.downloaded?.length);
+    addCount(summary, "failedCount", downloadResult.failed?.length);
+
+    const uploadResult = await uploadReadyStoriesToYoto(storyCardId);
+    addCount(summary, "uploadedCount", uploadResult.uploaded?.length);
+    addCount(summary, "waitingCount", uploadResult.waiting?.length);
+    addCount(summary, "failedCount", uploadResult.failed?.length);
+
+    const syncResult = await updateYotoStoryPlaylistForStoryCard(storyCardId);
+    addCount(summary, "syncedCount", syncResult.synced?.length);
+    addCount(summary, "waitingCount", syncResult.waiting?.length);
+    addCount(summary, "failedCount", syncResult.failed?.length);
+
+    const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+    addCount(summary, "cleanedCount", cleanupResult.cleaned?.length);
+    addCount(summary, "failedCount", cleanupResult.failed?.length);
+
+    const result = summary.failedCount ? "failed" : summary.waitingCount ? "waiting" : "success";
+    const message = getAutomaticResultMessage(result);
+    const finishedAt = new Date();
+    const finishedNextAutomaticCheckAt = getNextAutomaticCheckAt(storyCard, finishedAt);
+    const finishedCard = await updateStoryCardAutomaticState(storyCardId, {
+      lastAutomaticCheckAt: startedAt.toISOString(),
+      nextAutomaticCheckAt: finishedNextAutomaticCheckAt,
+      lastAutomaticResult: result,
+      lastAutomaticMessage: message,
+    });
+    const eventType =
+      result === "waiting"
+        ? "story_card_auto_check_waiting"
+        : result === "failed"
+          ? "story_card_auto_check_failed"
+          : "story_card_auto_check_finished";
+
+    await addActivityLogEntry({
+      level: result === "failed" ? "warning" : "info",
+      storyCardId,
+      eventType,
+      title: result === "failed" ? "Automatic check needs help" : "Automatic check finished",
+      message,
+      details: getSafeAutomaticDetails(finishedCard, {
+        ...summary,
+        lastAutomaticCheckAt: startedAt.toISOString(),
+        nextAutomaticCheckAt: finishedNextAutomaticCheckAt,
+      }),
+    });
+
+    return {
+      result,
+      message,
+      ...summary,
+      stories: cleanupResult.stories || syncResult.stories || uploadResult.stories || downloadResult.stories,
+    };
+  } catch (error) {
+    const message = error.expose ? error.message : "Automatic check could not finish.";
+    let storyCard = null;
+    let nextAutomaticCheckAt = "";
+
+    try {
+      const current = await getStoryCardOrThrow(storyCardId);
+      storyCard = current.storyCard;
+      nextAutomaticCheckAt = getNextAutomaticCheckAt(storyCard, new Date());
+      await updateStoryCardAutomaticState(storyCardId, {
+        lastAutomaticCheckAt: new Date().toISOString(),
+        nextAutomaticCheckAt,
+        lastAutomaticResult: "failed",
+        lastAutomaticMessage: message,
+      });
+    } catch (stateError) {
+      console.warn("Could not update automatic check state.", stateError.message);
+    }
+
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      eventType: "story_card_auto_check_failed",
+      title: "Automatic check needs help",
+      message,
+      details: getSafeAutomaticDetails(storyCard || {}, {
+        storyCardId,
+        nextAutomaticCheckAt,
+        failedCount: 1,
+      }),
+    });
+
+    return {
+      result: "failed",
+      message,
+      failedCount: 1,
+      stories: await getStoryQueueForStoryCard(storyCardId).catch(() => []),
+    };
+  } finally {
+    automaticRunsInProgress.delete(storyCardId);
+  }
+};
+
+const runAutomaticSchedulerTick = async () => {
+  if (automaticSchedulerRunning) {
+    await addActivityLogEntry({
+      level: "info",
+      eventType: "scheduler_skipped",
+      title: "Automatic scheduler skipped",
+      message: "Automatic checks are already running.",
+      details: {},
+    });
+    return { processedCount: 0, skipped: true };
+  }
+
+  automaticSchedulerRunning = true;
+
+  try {
+    const storyCards = await readStoryCards();
+    const now = new Date();
+    const dueCards = storyCards.filter((storyCard) => getAutomaticDueStatus(storyCard, now).due);
+
+    if (!dueCards.length) {
+      return { processedCount: 0, skipped: false };
+    }
+
+    await addActivityLogEntry({
+      level: "info",
+      eventType: "scheduler_started",
+      title: "Automatic scheduler started",
+      message: "Automatic checks started.",
+      details: { dueStoryCardCount: dueCards.length },
+    });
+
+    const results = [];
+    for (const storyCard of dueCards) {
+      const result = await runAutomaticStoryCardPipeline(storyCard.id);
+      results.push({ storyCardId: storyCard.id, ...result });
+    }
+
+    await addActivityLogEntry({
+      level: "info",
+      eventType: "scheduler_finished",
+      title: "Automatic scheduler finished",
+      message: "Automatic checks finished.",
+      details: {
+        dueStoryCardCount: dueCards.length,
+        processedCount: results.length,
+        waitingCount: results.reduce((total, result) => total + Number(result.waitingCount || 0), 0),
+        failedCount: results.reduce((total, result) => total + Number(result.failedCount || 0), 0),
+      },
+    });
+
+    return { processedCount: results.length, skipped: false, results };
+  } catch (error) {
+    await addActivityLogEntry({
+      level: "error",
+      eventType: "scheduler_failed",
+      title: "Automatic scheduler needs help",
+      message: "Automatic check could not finish.",
+      details: {},
+    });
+    console.error("Automatic scheduler failed.", error);
+    return { processedCount: 0, skipped: false, failed: true };
+  } finally {
+    automaticSchedulerRunning = false;
+  }
+};
+
+const scheduleAutomaticSchedulerTick = (delayMs = AUTOMATIC_SCHEDULER_INTERVAL_MS) => {
+  automaticSchedulerTimer = setTimeout(async () => {
+    await runAutomaticSchedulerTick();
+    scheduleAutomaticSchedulerTick(AUTOMATIC_SCHEDULER_INTERVAL_MS);
+  }, delayMs);
+
+  if (typeof automaticSchedulerTimer.unref === "function") {
+    automaticSchedulerTimer.unref();
+  }
+};
+
+const startAutomaticStoryCardScheduler = () => {
+  if (automaticSchedulerTimer) return;
+  scheduleAutomaticSchedulerTick(AUTOMATIC_SCHEDULER_START_DELAY_MS);
 };
 
 const updateQueuedStoryFields = async (storyCardId, storyId, fields) => {
@@ -3695,6 +4099,7 @@ const handleApi = async (request, response, pathname) => {
     const playlistPreviewRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/playlist-preview\/?$/);
     const syncPlaylistRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/sync-playlist\/?$/);
     const cleanupRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/cleanup\/?$/);
+    const runNowRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/run-now\/?$/);
     const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
     const storyUploadReadyRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/upload-ready\/?$/);
@@ -3782,6 +4187,15 @@ const handleApi = async (request, response, pathname) => {
     if (request.method === "POST" && cleanupRoute) {
       const storyCardId = decodeURIComponent(cleanupRoute[1]);
       sendJson(response, 200, await cleanupSyncedStoryAudioForStoryCard(storyCardId));
+      return;
+    }
+
+    if (request.method === "POST" && runNowRoute) {
+      const storyCardId = decodeURIComponent(runNowRoute[1]);
+      sendJson(response, 200, await runAutomaticStoryCardPipeline(storyCardId, {
+        ignoreSchedule: true,
+        source: "run-now",
+      }));
       return;
     }
 
@@ -3915,4 +4329,5 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, () => {
   console.log(`Feed Your Yoto running at http://127.0.0.1:${PORT}`);
+  startAutomaticStoryCardScheduler();
 });
