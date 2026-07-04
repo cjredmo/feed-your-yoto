@@ -2759,6 +2759,25 @@ const getYotoPlaylistContent = async (storyCard) => {
 };
 
 const formatYotoTrackKey = (index) => String(index + 1).padStart(2, "0");
+const formatYotoChapterKey = (index) => String(index + 1).padStart(3, "0");
+
+const getYotoDisplay = (source = {}) => {
+  const display = source && typeof source === "object" ? source : {};
+  const nextDisplay = {
+    icon16x16: display.icon16x16 || null,
+  };
+  if (isHttpUrl(display.iconUrl16x16)) nextDisplay.iconUrl16x16 = display.iconUrl16x16;
+  return nextDisplay;
+};
+
+const getYotoTrackTotals = (tracks = []) =>
+  tracks.reduce(
+    (totals, track) => ({
+      duration: totals.duration + Number(track.duration || 0),
+      fileSize: totals.fileSize + Number(track.fileSize || 0),
+    }),
+    { duration: 0, fileSize: 0 }
+  );
 
 const getMissingYotoTrackMetadataFields = (story = {}) => {
   const missing = [];
@@ -2770,7 +2789,7 @@ const getMissingYotoTrackMetadataFields = (story = {}) => {
   return missing;
 };
 
-const buildYotoPlaylistTrackFromStory = (story, index) => {
+const buildYotoPlaylistTrackFromStory = (story, index, options = {}) => {
   const missingMetadataFields = getMissingYotoTrackMetadataFields(story);
   if (missingMetadataFields.length) {
     throw createYotoPlaylistUpdateError("Feed Your Yoto could not build playlist tracks from the uploaded stories.", 400, {
@@ -2783,7 +2802,7 @@ const buildYotoPlaylistTrackFromStory = (story, index) => {
     });
   }
 
-  const key = formatYotoTrackKey(index);
+  const key = options.key || formatYotoTrackKey(index);
   const track = {
     key,
     title: String(story.title || "Untitled story").trim(),
@@ -2793,9 +2812,7 @@ const buildYotoPlaylistTrackFromStory = (story, index) => {
     fileSize: Number(story.yotoFileSize || story.fileSize || 0),
     format: getYotoFormatFromStory(story),
     type: "audio",
-    display: {
-      icon16x16: null,
-    },
+    display: getYotoDisplay(),
   };
 
   const channels = getNormalizedYotoChannels(story.yotoChannels);
@@ -2823,23 +2840,48 @@ const buildYotoPlaylistTracksFromStories = (stories = []) => {
   return { tracks, readyStories, skippedStories };
 };
 
-const buildYotoPlaylistChapters = (currentCard, storyCard, tracks) => {
+const buildYotoPlaylistChapterFromTrack = (track, index, currentCard = {}) => {
   const existingChapters = asArray(currentCard?.content?.chapters).filter(
     (chapter) => chapter && typeof chapter === "object"
   );
-  const chapterTemplate = existingChapters[0] || {};
-  const display = chapterTemplate.display && typeof chapterTemplate.display === "object"
-    ? chapterTemplate.display
-    : { icon16x16: null };
+  const chapterTemplate = existingChapters[index] || {};
+  const chapterTrack = {
+    ...track,
+    key: "01",
+    overlayLabel: String(index + 1),
+  };
+
+  return {
+    key: formatYotoChapterKey(index),
+    title: String(track.title || "Untitled story").trim(),
+    overlayLabel: String(index + 1),
+    tracks: [chapterTrack],
+    defaultTrackDisplay: chapterTemplate.defaultTrackDisplay ?? null,
+    defaultTrackAmbient: chapterTemplate.defaultTrackAmbient ?? null,
+    duration: Number(track.duration || 0),
+    fileSize: Number(track.fileSize || 0),
+    display: getYotoDisplay(chapterTemplate.display || track.display),
+    hasStreams: false,
+  };
+};
+
+const buildYotoPlaylistChapters = (currentCard, storyCard, tracks) => {
+  if (tracks.length) {
+    return tracks.map((track, index) => buildYotoPlaylistChapterFromTrack(track, index, currentCard));
+  }
 
   return [
     {
-      ...chapterTemplate,
-      key: String(chapterTemplate.key || "01"),
-      title: String(chapterTemplate.title || storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist"),
-      overlayLabel: String(chapterTemplate.overlayLabel || "1"),
-      display,
-      tracks,
+      key: "001",
+      title: String(storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist"),
+      overlayLabel: "1",
+      tracks: [],
+      defaultTrackDisplay: null,
+      defaultTrackAmbient: null,
+      duration: 0,
+      fileSize: 0,
+      display: getYotoDisplay(),
+      hasStreams: false,
     },
   ];
 };
@@ -2848,14 +2890,26 @@ const buildYotoPlaylistUpdatePayload = (currentCard, storyCard, tracks) => {
   const content = currentCard.content && typeof currentCard.content === "object"
     ? { ...currentCard.content }
     : {};
+  const trackTotals = getYotoTrackTotals(tracks);
   content.chapters = buildYotoPlaylistChapters(currentCard, storyCard, tracks);
   if (!content.playbackType) content.playbackType = "linear";
   if (!content.config) content.config = { resumeTimeout: 2592000 };
+  content.config = { ...content.config, resumeTimeout: Number(content.config.resumeTimeout || 2592000) };
+
+  const metadata = currentCard.metadata && typeof currentCard.metadata === "object"
+    ? { ...currentCard.metadata }
+    : {};
+  metadata.media = {
+    ...(metadata.media && typeof metadata.media === "object" ? metadata.media : {}),
+    duration: trackTotals.duration,
+    fileSize: trackTotals.fileSize,
+    hasStreams: false,
+  };
 
   const payload = {
     cardId: currentCard.cardId || storyCard.yotoPlaylistId,
     title: currentCard.title || storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist",
-    metadata: currentCard.metadata && typeof currentCard.metadata === "object" ? currentCard.metadata : {},
+    metadata,
     content,
   };
 
