@@ -1076,11 +1076,53 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
   const beforePreview = action === "add_back"
     ? getPlaylistPreviewForStoryCard(storyCard, storyQueue.filter((story) => story.storyCardId === storyCardId))
     : null;
+  let movedOffForAddBack = null;
 
   if (action === "add_back") {
     if (!canStoryOccupyPlaylistSlot(nextStory)) {
       throw createExposedError("This story needs an audio file before it can be added back.");
     }
+
+    const limit = storyCard.playlistLimit === "all" ? Infinity : Number(storyCard.playlistLimit || 10);
+    const currentLineup = beforePreview?.onYotoSoon || [];
+    const alreadyInLineup = currentLineup.some((story) => story.id === nextStory.id);
+
+    if (!alreadyInLineup && Number.isFinite(limit) && currentLineup.length >= limit) {
+      const replacementCandidates = currentLineup
+        .filter((story) => !(story.isPinned && storyCard.favoritesNeverRotate !== false))
+        .sort((first, second) => {
+          const firstDate = first.publishedAt || first.firstSeenAt || "";
+          const secondDate = second.publishedAt || second.firstSeenAt || "";
+          return new Date(firstDate).getTime() - new Date(secondDate).getTime();
+        });
+
+      if (!replacementCandidates.length) {
+        await addActivityLogEntry({
+          level: "info",
+          storyCardId,
+          storyId: nextStory.id,
+          eventType: "story_add_back_blocked",
+          title: "Story stayed resting",
+          message: "All current playlist stories are favorited, so nothing was replaced.",
+          details: { step: "Updating Story Queue" },
+        });
+        throw createExposedError("All current playlist stories are favorited, so Feed Your Yoto will not replace them.");
+      }
+
+      movedOffForAddBack = replacementCandidates[0];
+      const movedIndex = storyQueue.findIndex((story) => story.id === movedOffForAddBack.id);
+      if (movedIndex >= 0) {
+        storyQueue[movedIndex] = {
+          ...storyQueue[movedIndex],
+          isSelected: false,
+          isSkipped: false,
+          status: "rotated_off",
+          statusLabel: storyStatusLabels.rotated_off,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+    }
+
     nextStory.isSelected = true;
     nextStory.isSkipped = false;
     nextStory.status = getAddedBackStoryStatus(nextStory);
@@ -1145,40 +1187,13 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
       message: "Story added back to the playlist.",
     });
 
-    const afterPreview = getPlaylistPreviewForStoryCard(
-      storyCard,
-      storyQueue.filter((story) => story.storyCardId === storyCardId)
-    );
-    const afterIds = new Set(afterPreview.onYotoSoon.map((story) => story.id));
-    if (!afterIds.has(nextStory.id) && storyCard.playlistLimit !== "all") {
-      throw createExposedError("This playlist is full of favorite stories. Remove a favorite first, then add this story back.");
-    }
-
-    const movedOff = (beforePreview?.onYotoSoon || []).find(
-      (story) =>
-        story.id !== nextStory.id &&
-        !afterIds.has(story.id) &&
-        !(story.isPinned && storyCard.favoritesNeverRotate !== false)
-    );
-
-    if (movedOff) {
-      const movedIndex = storyQueue.findIndex((story) => story.id === movedOff.id);
-      if (movedIndex >= 0) {
-        storyQueue[movedIndex] = {
-          ...storyQueue[movedIndex],
-          isSelected: false,
-          isSkipped: false,
-          status: "rotated_off",
-          statusLabel: storyStatusLabels.rotated_off,
-          updatedAt: new Date().toISOString(),
-        };
-        activityEntries.push({
-          storyId: movedOff.id,
-          eventType: "story_rotated_off",
-          title: "Older story resting",
-          message: "An older story was moved to resting.",
-        });
-      }
+    if (movedOffForAddBack) {
+      activityEntries.push({
+        storyId: movedOffForAddBack.id,
+        eventType: "story_rotated_off",
+        title: "Older story resting",
+        message: "An older story was moved to resting.",
+      });
     }
   }
 

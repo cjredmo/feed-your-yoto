@@ -980,9 +980,21 @@ const setStoryDownloadState = (nextState) => {
   renderStoryQueue();
 };
 
+const getStoryStatusClass = (story, group = "new") => {
+  if (storyNeedsHelp(story)) return "is-error";
+  if (isStoryMissingRssAudio(story) || story.status === "skipped") return "is-skipped";
+  if (group === "old" || story.status === "rotated_off") return "is-resting";
+  if (isStoryWaitingForYoto(story)) return "is-waiting";
+  if (["downloading", "downloaded", "uploading", "uploaded", "adding_to_playlist", "selected", "discovered"].includes(story?.status)) {
+    return "is-active";
+  }
+  if (story?.status === "synced") return "is-ready";
+  return "is-active";
+};
+
 const getStoryDisplayStatus = (story, group = "new") => {
   if (isStoryMissingRssAudio(story) || story.status === "skipped") return "Skipped";
-  if (group === "old" || story.status === "rotated_off") return "Old story resting";
+  if (group === "old" || story.status === "rotated_off") return "Resting story";
   if (isStoryWaitingForYoto(story)) return "Waiting on Yoto";
   if (storyNeedsHelp(story)) return "Needs help";
   if (group === "on_yoto" && story.status === "discovered") return "Picked for Yoto";
@@ -1146,7 +1158,7 @@ const renderStoryStatusSummary = (preview) => {
         <p>Feed Your Yoto keeps this Story Playlist filled from the Podcast Link.</p>
       </div>
       <div class="story-summary-counts" aria-label="Story Playlist counts">
-        <span><strong>${preview.onYotoSoon.length}</strong> On Yoto soon</span>
+        <span><strong>${preview.onYotoSoon.length}</strong> Playlist Lineup</span>
         <span><strong>${preview.newStories.length}</strong> New stories</span>
         <span><strong>${preview.favorites.length}</strong> Favorites</span>
         <span><strong>${needsHelpCount}</strong> Needs help</span>
@@ -1176,9 +1188,10 @@ const renderManualPreparePanel = (storiesToPrepare, storiesToSync = 0) => {
   `;
 };
 
-const getPreviewStorySets = (preview) => ({
+const getPreviewStorySets = (preview, stories = []) => ({
   on_yoto: new Set((preview.onYotoSoon || []).map((story) => story.id)),
   new: new Set((preview.newStories || []).map((story) => story.id)),
+  needs_help: new Set((stories || []).filter(storyNeedsHelp).map((story) => story.id)),
   favorites: new Set((preview.favorites || []).map((story) => story.id)),
   old: new Set((preview.oldStoriesResting || []).map((story) => story.id)),
   skipped: new Set((preview.skippedStories || []).map((story) => story.id)),
@@ -1194,22 +1207,24 @@ const getStoryGroupFromPreview = (story, previewSets) => {
 
 const storyFilterOptions = [
   { key: "all", label: "All Stories" },
-  { key: "on_yoto", label: "On Yoto Soon" },
-  { key: "new", label: "New Stories" },
+  { key: "on_yoto", label: "Playlist Lineup" },
+  { key: "needs_help", label: "Needs Help" },
   { key: "favorites", label: "Favorites" },
-  { key: "old", label: "Old Stories Resting" },
+  { key: "old", label: "Resting Stories" },
+  { key: "skipped", label: "Skipped" },
 ];
 
-const getStoryFilterCounts = (preview, totalCount) => ({
+const getStoryFilterCounts = (preview, totalCount, stories = []) => ({
   all: totalCount,
   on_yoto: preview.onYotoSoon.length,
-  new: preview.newStories.length,
+  needs_help: stories.filter(storyNeedsHelp).length,
   favorites: preview.favorites.length,
   old: preview.oldStoriesResting.length,
+  skipped: preview.skippedStories.length,
 });
 
 const renderStoryFilterTags = (preview, totalCount) => {
-  const counts = getStoryFilterCounts(preview, totalCount);
+  const counts = getStoryFilterCounts(preview, totalCount, storyQueueState.stories);
   const selectedFilter = storyQueueState.filter || "all";
 
   return `
@@ -1279,7 +1294,7 @@ const renderStoryQueue = () => {
     ? `<p class="story-queue-unsaved">${pendingCount} Story Queue change${pendingCount === 1 ? "" : "s"} ready to save.</p>`
     : "";
   const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
-  const previewSets = getPreviewStorySets(preview);
+  const previewSets = getPreviewStorySets(preview, storyQueueState.stories);
   const sortedStories = sortPreviewStories(storyQueueState.stories);
   const filteredStories = getFilteredStories(sortedStories, previewSets);
 
@@ -1313,7 +1328,7 @@ const getStoryControlsForGroup = (story, group) => {
 
   if (confirmAddBack) {
     return [
-      { action: "confirm_add_back", label: "Add Back", active: false, style: "outline" },
+      { action: "confirm_add_back", label: "Confirm Add Back", active: false, style: "outline" },
       { action: "cancel_add_back", label: "Cancel", active: false },
     ];
   }
@@ -1346,15 +1361,46 @@ const getStoryControlsForGroup = (story, group) => {
   return controls;
 };
 
-const getStoryContextNote = (story, group) => {
+const getStoryAddBackReplacementCandidate = (story) => {
+  const rules = getEditorStoryRules();
+  if (rules.playlistLimit === "all") return null;
+
+  const preview = getPlaylistPreview(rules, storyQueueState.stories);
+  const limit = Number(rules.playlistLimit || defaultStoryRules.playlistLimit);
+  if (!Number.isFinite(limit) || preview.onYotoSoon.length < limit) return null;
+
+  const candidates = preview.onYotoSoon
+    .filter((item) => item.id !== story.id)
+    .filter((item) => !(item.isPinned && rules.favoritesNeverRotate))
+    .sort((first, second) => getStorySortValue(first) - getStorySortValue(second));
+
+  if (candidates.length) return candidates[0];
+  return { blocked: true };
+};
+
+const getStoryContextMarkup = (story, group) => {
   if (storyQueueState.addBackConfirmId === story.id) {
-    return "Adding this story back may replace one of the oldest stories currently on this playlist that is not favorited.";
+    const replacement = getStoryAddBackReplacementCandidate(story);
+    const replacementText = replacement?.blocked
+      ? "All current playlist stories are favorited, so Feed Your Yoto will not replace them."
+      : replacement?.title
+        ? `To make room, Feed Your Yoto will move '${replacement.title}' to resting.`
+        : "";
+
+    return `
+      <div class="story-confirmation">
+        <h5>Add this story back to the playlist?</h5>
+        <p>This may move one of the oldest non-favorite stories to resting so there is room.</p>
+        ${replacementText ? `<p>${escapeHtml(replacementText)}</p>` : ""}
+      </div>
+    `;
   }
-  if (isStoryMissingRssAudio(story)) return MISSING_AUDIO_PARENT_MESSAGE;
+
+  if (isStoryMissingRssAudio(story)) return `<p class="story-note">${escapeHtml(MISSING_AUDIO_PARENT_MESSAGE)}</p>`;
   if (group === "old" || story.status === "rotated_off") {
-    return "This story was moved off the playlist to make room for newer stories.";
+    return `<p class="story-note">This story was moved off the playlist to make room for newer stories.</p>`;
   }
-  if (story.status === "skipped") return "This story is skipped for now.";
+  if (story.status === "skipped") return `<p class="story-note">This story is skipped for now.</p>`;
   return "";
 };
 
@@ -1472,7 +1518,8 @@ const renderQueuedStory = (story, group = "new") => {
   const controls = getStoryControlsForGroup(story, group);
   const downloadAction = renderStoryDownloadAction(story, group);
   const displayStatus = getStoryDisplayStatus(story, group);
-  const contextNote = getStoryContextNote(story, group);
+  const statusClass = getStoryStatusClass(story, group);
+  const contextMarkup = getStoryContextMarkup(story, group);
   const controlMarkup = controls
     .map(
       (control) => {
@@ -1490,8 +1537,8 @@ const renderQueuedStory = (story, group = "new") => {
           ${story.isPinned ? `<span class="favorite-badge">Favorite</span>` : ""}
         </div>
         <p>${escapeHtml(publishedAt)}</p>
-        <span class="story-status ${storyNeedsHelp(story) ? "is-error" : ""}">${escapeHtml(displayStatus)}</span>
-        ${contextNote ? `<p class="story-note">${escapeHtml(contextNote)}</p>` : ""}
+        <span class="story-status ${escapeAttribute(statusClass)}">${escapeHtml(displayStatus)}</span>
+        ${contextMarkup}
         ${storyNeedsHelp(story) && getStoryDownloadError(story) ? `<p class="story-error">${escapeHtml(getStoryDownloadError(story))}</p>` : ""}
         ${story.uploadError ? `<p class="story-error">${escapeHtml(story.uploadError)}</p>` : ""}
         ${isStoryWaitingForYoto(story) ? `<p class="story-waiting-note">${escapeHtml(story.playlistUpdateError || YOTO_PROCESSING_MESSAGE)}</p>` : ""}

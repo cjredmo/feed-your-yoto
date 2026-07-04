@@ -1563,8 +1563,33 @@ h2 {
 }
 
 .story-status {
+  color: #21356f;
+  background: #e9eefc;
+}
+
+.story-status.is-ready {
   color: #11633d;
   background: #ddf7ea;
+}
+
+.story-status.is-active {
+  color: #2347b7;
+  background: #e9eefc;
+}
+
+.story-status.is-waiting {
+  color: #1558a8;
+  background: #e6f2ff;
+}
+
+.story-status.is-skipped {
+  color: #6f5a1b;
+  background: #f5edda;
+}
+
+.story-status.is-resting {
+  color: #53627f;
+  background: #eef1f7;
 }
 
 .story-status.is-error {
@@ -1587,6 +1612,27 @@ h2 {
   font-size: 14px;
   font-weight: 900;
   line-height: 1.35;
+}
+
+.story-confirmation {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 2px solid #d9dded;
+  border-radius: 8px;
+  background: #f7f8fc;
+}
+
+.story-confirmation h5 {
+  margin: 0;
+  color: var(--blue-dark);
+  font-size: 15px;
+}
+
+.story-confirmation p {
+  margin: 0;
+  color: var(--muted);
+  font-weight: 900;
 }
 
 .story-waiting-note {
