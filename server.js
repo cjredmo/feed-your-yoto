@@ -104,6 +104,11 @@ const deleteFileIfExists = async (filePath) => {
   }
 };
 
+const isPathInsideDirectory = (filePath, directoryPath) => {
+  const relativePath = path.relative(path.resolve(directoryPath), path.resolve(filePath));
+  return Boolean(relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+};
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const readRequestJson = (request) =>
@@ -950,6 +955,7 @@ const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
     statusLabel: storyStatusLabels[status] || storyStatusLabels.discovered,
     downloadStatus: String(existingStory.downloadStatus || "").trim(),
     downloadedAt: String(existingStory.downloadedAt || "").trim(),
+    cleanedLocalAudioAt: String(existingStory.cleanedLocalAudioAt || "").trim(),
     localFilePath: String(existingStory.localFilePath || "").trim(),
     localFileName: String(existingStory.localFileName || "").trim(),
     fileSize: Number(existingStory.fileSize || 0),
@@ -1264,6 +1270,144 @@ const fileExists = async (filePath) => {
 const hasExistingStoryDownload = async (story) => {
   if (!story?.localFilePath || !story?.sha256 || !Number(story?.fileSize)) return false;
   return fileExists(story.localFilePath);
+};
+
+const isStorySafeForLocalAudioCleanup = (story = {}) =>
+  story.status === "synced" &&
+  story.playlistUpdateStatus === "synced" &&
+  Boolean(story.localFilePath) &&
+  story.downloadStatus === "downloaded";
+
+const getLocalAudioCleanupSkipReason = (story = {}) => {
+  if (!story) return "Story was not found.";
+  if (story.status !== "synced") return "Story is not Ready on Yoto yet.";
+  if (story.playlistUpdateStatus !== "synced") return "Story Playlist has not been verified yet.";
+  if (!story.localFilePath) return "No local audio file to clean up.";
+  if (story.downloadStatus !== "downloaded") return "Local audio was already cleaned or is not downloaded.";
+  return "Story is not ready for local cleanup yet.";
+};
+
+const getSafeCleanupDetails = (story = {}, extras = {}) => ({
+  storyId: String(story.id || extras.storyId || "").trim(),
+  fileSize: Number(story.fileSize || extras.fileSize || 0),
+  cleanedLocalAudioAt: String(extras.cleanedLocalAudioAt || story.cleanedLocalAudioAt || "").trim(),
+});
+
+const cleanupSyncedStoryAudio = async (storyCardId, storyId) => {
+  const storyQueue = await readStoryQueue();
+  const story = storyQueue.find((item) => item.storyCardId === storyCardId && item.id === storyId);
+
+  if (!isStorySafeForLocalAudioCleanup(story)) {
+    return {
+      cleaned: false,
+      skipped: true,
+      reason: getLocalAudioCleanupSkipReason(story),
+      story: story || null,
+    };
+  }
+
+  const downloadsDir = await getDownloadsDir();
+  if (!isPathInsideDirectory(story.localFilePath, downloadsDir)) {
+    const message = "Feed Your Yoto could not clean up this local audio file.";
+    const details = getSafeCleanupDetails(story);
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_cleanup_failed",
+      title: "Clean up needs help",
+      message,
+      details,
+    });
+    return {
+      cleaned: false,
+      skipped: false,
+      reason: "Local audio file was outside the downloads folder.",
+      story,
+    };
+  }
+
+  await addActivityLogEntry({
+    level: "info",
+    storyCardId,
+    storyId,
+    eventType: "story_cleanup_started",
+    title: "Cleaning up local audio",
+    message: "Cleaning up local audio.",
+    details: getSafeCleanupDetails(story),
+  });
+
+  try {
+    await deleteFileIfExists(story.localFilePath);
+    const cleanedLocalAudioAt = new Date().toISOString();
+    const cleanedStory = await updateQueuedStoryFields(storyCardId, storyId, {
+      localFilePath: "",
+      localFileName: "",
+      downloadStatus: "cleaned",
+      cleanedLocalAudioAt,
+    });
+
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId,
+      eventType: "story_cleanup_finished",
+      title: "Local audio cleaned up",
+      message: "Local audio was cleaned up.",
+      details: getSafeCleanupDetails(cleanedStory, { cleanedLocalAudioAt }),
+    });
+
+    return { cleaned: true, skipped: false, story: cleanedStory };
+  } catch (error) {
+    const message = "Feed Your Yoto could not clean up this local audio file.";
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_cleanup_failed",
+      title: "Clean up needs help",
+      message,
+      details: getSafeCleanupDetails(story),
+    });
+    return {
+      cleaned: false,
+      skipped: false,
+      reason: error.message || message,
+      story,
+    };
+  }
+};
+
+const cleanupSyncedStoryAudioForStoryCard = async (storyCardId) => {
+  await getStoryCardOrThrow(storyCardId);
+  const storyQueue = await readStoryQueue();
+  const cardStories = storyQueue.filter((story) => story.storyCardId === storyCardId);
+  const cleaned = [];
+  const skipped = [];
+  const failed = [];
+
+  for (const story of cardStories) {
+    if (!isStorySafeForLocalAudioCleanup(story)) {
+      skipped.push({ storyId: story.id, reason: getLocalAudioCleanupSkipReason(story) });
+      continue;
+    }
+
+    const result = await cleanupSyncedStoryAudio(storyCardId, story.id);
+    if (result.cleaned) {
+      cleaned.push(result.story);
+    } else if (result.skipped) {
+      skipped.push({ storyId: story.id, reason: result.reason });
+    } else {
+      failed.push({ storyId: story.id, reason: result.reason });
+    }
+  }
+
+  return {
+    cleaned,
+    skipped,
+    failed,
+    stories: await getStoryQueueForStoryCard(storyCardId),
+  };
 };
 
 const updateQueuedStoryFields = async (storyCardId, storyId, fields) => {
@@ -3221,6 +3365,8 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
         playlistUpdateFailureType: "",
       }));
     }
+
+    await cleanupSyncedStoryAudioForStoryCard(storyCardId);
   } catch (error) {
     const details = getSafePlaylistDetails({
       ...error,
@@ -3524,6 +3670,7 @@ const handleApi = async (request, response, pathname) => {
     const storyDiscoverRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/discover\/?$/);
     const playlistPreviewRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/playlist-preview\/?$/);
     const syncPlaylistRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/sync-playlist\/?$/);
+    const cleanupRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/cleanup\/?$/);
     const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
     const storyUploadReadyRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/upload-ready\/?$/);
@@ -3605,6 +3752,12 @@ const handleApi = async (request, response, pathname) => {
     if (request.method === "POST" && syncPlaylistRoute) {
       const storyCardId = decodeURIComponent(syncPlaylistRoute[1]);
       sendJson(response, 200, await updateYotoStoryPlaylistForStoryCard(storyCardId));
+      return;
+    }
+
+    if (request.method === "POST" && cleanupRoute) {
+      const storyCardId = decodeURIComponent(cleanupRoute[1]);
+      sendJson(response, 200, await cleanupSyncedStoryAudioForStoryCard(storyCardId));
       return;
     }
 

@@ -122,6 +122,7 @@ const dialogArt = document.querySelector("#dialogArt");
 const dialogTitle = document.querySelector("#dialogTitle");
 const dialogStatus = document.querySelector("#dialogStatus");
 const dialogCrawl = document.querySelector("#dialogCrawl");
+const dialogPodcastDescription = document.querySelector("#dialogPodcastDescription");
 const playlistName = document.querySelector("#playlistName");
 const rssFeed = document.querySelector("#rssFeed");
 const yotoCard = document.querySelector("#yotoCard");
@@ -189,6 +190,21 @@ const escapeHtml = (value) =>
     .replaceAll("'", "&#39;");
 
 const escapeAttribute = escapeHtml;
+
+const getPlainTextFromMarkup = (value) => {
+  const rawText = String(value || "").trim();
+  if (!rawText) return "";
+
+  const parser = new DOMParser();
+  const parsed = parser.parseFromString(rawText, "text/html");
+  return (parsed.body.textContent || rawText).replace(/\s+/g, " ").trim();
+};
+
+const truncateText = (value, maxLength = 260) => {
+  const text = getPlainTextFromMarkup(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1).trim()}...`;
+};
 
 const setModalLock = () => {
   const modalOpen = !backdrop.hidden || !setupBackdrop.hidden || !authBackdrop.hidden;
@@ -967,6 +983,29 @@ const getStoryQueueLastChecked = () => {
   return activeCard?.lastStoryDiscoveryAt ? `Last checked ${formatDateTime(activeCard.lastStoryDiscoveryAt)}` : "";
 };
 
+const getStoryQueueCard = () =>
+  storyCards.find((storyCard) => storyCard.id === storyQueueState.storyCardId);
+
+const renderStoryQueuePodcastSummary = () => {
+  const activeCard = getStoryQueueCard();
+  if (!activeCard) return "";
+
+  const podcastTitle = activeCard.podcastTitle || activeCard.name || "Podcast";
+  const podcastDescription = truncateText(activeCard.podcastDescription, 320);
+  const sourceLabel = getPodcastPreview(activeCard.podcastLink);
+
+  return `
+    <article class="story-podcast-summary">
+      <div>
+        <p class="section-kicker">Podcast</p>
+        <h4>${escapeHtml(podcastTitle)}</h4>
+        ${podcastDescription ? `<p>${escapeHtml(podcastDescription)}</p>` : ""}
+      </div>
+      <span>${escapeHtml(sourceLabel)}</span>
+    </article>
+  `;
+};
+
 const isStoryReadyToBringHome = (story) =>
   isStoryAudioUsable(story) &&
   story.status !== "downloaded" &&
@@ -1018,10 +1057,20 @@ const getStoryTrackerStep = (story, group = "new") => {
   return "found";
 };
 
+const isStoryActivelyProcessing = (story) =>
+  Boolean(
+    storyDownloadState.storyIds.has(story.id) ||
+      storyDownloadState.uploadIds.has(story.id) ||
+      ["downloading", "uploading", "adding_to_playlist"].includes(story?.status) ||
+      isStoryWaitingForYoto(story) ||
+      (storyDownloadState.syncing && story?.status === "uploaded")
+  );
+
 const shouldShowStoryTracker = (story, group = "new") => {
   if (isStoryMissingRssAudio(story)) return false;
   if (group === "old" || story.status === "skipped" || story.status === "rotated_off") return false;
-  return true;
+  if (storyNeedsHelp(story) || story.status === "synced" || story.status === "downloaded") return false;
+  return isStoryActivelyProcessing(story);
 };
 
 const renderStoryTracker = (story, group = "new") => {
@@ -1168,20 +1217,20 @@ const renderStoryStatusSummary = (preview) => {
   `;
 };
 
-const renderManualPreparePanel = (storiesToPrepare, storiesToSync = 0) => {
+const renderManualPreparePanel = (storiesToPrepareCount, storiesToSync = 0) => {
   const busy = storyDownloadState.bulk;
   const syncing = storyDownloadState.syncing;
   const helper = storiesToSync
     ? `${storiesToSync} ${storiesToSync === 1 ? "story is" : "stories are"} ready for the Story Playlist.`
-    : storiesToPrepare.length
-      ? `${storiesToPrepare.length} ${storiesToPrepare.length === 1 ? "story is" : "stories are"} ready for the next step.`
+    : storiesToPrepareCount
+      ? `${storiesToPrepareCount} ${storiesToPrepareCount === 1 ? "story is" : "stories are"} ready for the next step.`
       : "Pick a story first, then Feed Your Yoto can prepare it.";
 
   return `
     <div class="story-download-panel">
       <p>${escapeHtml(helper)}</p>
       ${storiesToSync ? `<button class="outline-action" type="button" data-sync-playlist ${syncing ? "disabled" : ""}>${syncing ? "Updating Playlist..." : "Update Story Playlist"}</button>` : ""}
-      <button class="outline-action" type="button" data-download-selected ${!storiesToPrepare.length || busy ? "disabled" : ""}>
+      <button class="outline-action" type="button" data-download-selected ${!storiesToPrepareCount || busy ? "disabled" : ""}>
         ${busy ? "Preparing stories..." : "Prepare Stories"}
       </button>
     </div>
@@ -1274,12 +1323,14 @@ const renderStoryQueue = () => {
 
   const lastChecked = getStoryQueueLastChecked();
   const lastCheckedMarkup = lastChecked ? `<p class="story-queue-last">${escapeHtml(lastChecked)}</p>` : "";
+  const podcastSummaryMarkup = renderStoryQueuePodcastSummary();
   const queueMessageMarkup = storyQueueState.message
     ? `<p class="story-queue-note">${escapeHtml(storyQueueState.message)}</p>`
     : "";
 
   if (!storyQueueState.stories.length) {
     storyQueueContent.innerHTML = `
+      ${podcastSummaryMarkup}
       ${lastCheckedMarkup}
       ${queueMessageMarkup}
       <div class="story-queue-empty">
@@ -1299,10 +1350,12 @@ const renderStoryQueue = () => {
   const filteredStories = getFilteredStories(sortedStories, previewSets);
 
   storyQueueContent.innerHTML = `
+    ${podcastSummaryMarkup}
     ${lastCheckedMarkup}
     ${queueMessageMarkup}
     ${pendingMarkup}
     ${renderStoryStatusSummary(preview)}
+    <p class="story-queue-note">Local audio is cleaned up after stories are ready on Yoto.</p>
     ${renderStoryFilterTags(preview, storyQueueState.stories.length)}
     ${
       filteredStories.length
@@ -1515,6 +1568,7 @@ const renderStoryActivityDetails = (story) => {
 
 const renderQueuedStory = (story, group = "new") => {
   const publishedAt = story.publishedAt ? formatDateTime(story.publishedAt) : "No date yet";
+  const storyDescription = truncateText(story.description, 300);
   const controls = getStoryControlsForGroup(story, group);
   const downloadAction = renderStoryDownloadAction(story, group);
   const displayStatus = getStoryDisplayStatus(story, group);
@@ -1531,19 +1585,24 @@ const renderQueuedStory = (story, group = "new") => {
 
   return `
     <article class="story-item" data-story-id="${escapeAttribute(story.id)}">
-      <div class="story-item-copy">
-        <div class="story-item-title-row">
-          <h4>${escapeHtml(story.title || "Untitled story")}</h4>
-          ${story.isPinned ? `<span class="favorite-badge">Favorite</span>` : ""}
+      <div class="story-item-main">
+        <div class="story-item-copy">
+          <div class="story-item-title-row">
+            <h4>${escapeHtml(story.title || "Untitled story")}</h4>
+            ${story.isPinned ? `<span class="favorite-badge">Favorite</span>` : ""}
+          </div>
+          <div class="story-item-meta">
+            <span>${escapeHtml(publishedAt)}</span>
+            <span class="story-status ${escapeAttribute(statusClass)}">${escapeHtml(displayStatus)}</span>
+          </div>
+          ${storyDescription ? `<p class="story-description">${escapeHtml(storyDescription)}</p>` : ""}
+          ${contextMarkup}
+          ${storyNeedsHelp(story) && getStoryDownloadError(story) ? `<p class="story-error">${escapeHtml(getStoryDownloadError(story))}</p>` : ""}
+          ${story.uploadError ? `<p class="story-error">${escapeHtml(story.uploadError)}</p>` : ""}
+          ${isStoryWaitingForYoto(story) ? `<p class="story-waiting-note">${escapeHtml(story.playlistUpdateError || YOTO_PROCESSING_MESSAGE)}</p>` : ""}
+          ${renderStoryActivityDetails(story)}
         </div>
-        <p>${escapeHtml(publishedAt)}</p>
-        <span class="story-status ${escapeAttribute(statusClass)}">${escapeHtml(displayStatus)}</span>
-        ${contextMarkup}
-        ${storyNeedsHelp(story) && getStoryDownloadError(story) ? `<p class="story-error">${escapeHtml(getStoryDownloadError(story))}</p>` : ""}
-        ${story.uploadError ? `<p class="story-error">${escapeHtml(story.uploadError)}</p>` : ""}
-        ${isStoryWaitingForYoto(story) ? `<p class="story-waiting-note">${escapeHtml(story.playlistUpdateError || YOTO_PROCESSING_MESSAGE)}</p>` : ""}
         ${renderStoryTracker(story, group)}
-        ${renderStoryActivityDetails(story)}
       </div>
       ${controlMarkup || downloadAction ? `<div class="story-controls">${controlMarkup}${downloadAction}</div>` : ""}
     </article>
@@ -2144,10 +2203,8 @@ const populateEditorPlaylistOptions = (storyCard) => {
   yotoCard.value = currentId || options.find((option) => !option.disabled)?.id || "";
 };
 
-const openEditor = (storyCard) => {
-  activeCardId = storyCard.id;
-  hideDeleteConfirmation();
-  resetEditorSetupLock();
+const updateEditorPreview = (storyCard) => {
+  const podcastDescription = truncateText(storyCard.podcastDescription, 230);
 
   dialogArt.className = "dialog-cover card-picture playlist-card-picture";
   dialogArt.innerHTML = getStoryCardArtMarkup(storyCard);
@@ -2155,6 +2212,19 @@ const openEditor = (storyCard) => {
   dialogStatus.className = `status-pill status-${storyCard.statusType}`;
   dialogStatus.textContent = storyCard.status;
   dialogCrawl.textContent = `Next Check: ${getStoryCardNextCheckLabel(storyCard)}`;
+
+  if (dialogPodcastDescription) {
+    dialogPodcastDescription.textContent = podcastDescription;
+    dialogPodcastDescription.hidden = !podcastDescription;
+  }
+};
+
+const openEditor = (storyCard) => {
+  activeCardId = storyCard.id;
+  hideDeleteConfirmation();
+  resetEditorSetupLock();
+
+  updateEditorPreview(storyCard);
 
   playlistName.value = storyCard.name;
   rssFeed.value = storyCard.podcastLink;
@@ -2268,11 +2338,7 @@ const saveActiveCard = async () => {
     await loadStoryCards();
     const refreshedCard = storyCards.find((storyCard) => storyCard.id === activeCard.id) || savedStoryCard;
     if (refreshedCard) {
-      dialogArt.innerHTML = getStoryCardArtMarkup(refreshedCard);
-      dialogTitle.textContent = refreshedCard.name;
-      dialogStatus.className = `status-pill status-${refreshedCard.statusType}`;
-      dialogStatus.textContent = refreshedCard.status;
-      dialogCrawl.textContent = `Next Check: ${getStoryCardNextCheckLabel(refreshedCard)}`;
+      updateEditorPreview(refreshedCard);
       playlistName.value = refreshedCard.name;
       rssFeed.value = refreshedCard.podcastLink;
       populateEditorPlaylistOptions(refreshedCard);
