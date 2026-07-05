@@ -34,6 +34,13 @@ const AUTOMATIC_SCHEDULER_START_DELAY_MS = 15_000;
 const AUTOMATIC_SCHEDULER_INTERVAL_MS = 15 * 60 * 1000;
 const AUTOMATIC_STORY_CARD_INTERVAL_MS = 60 * 60 * 1000;
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
+const YOTO_MYO_MAX_TRACKS = 100;
+const YOTO_MYO_MAX_TOTAL_BYTES = 500 * 1024 * 1024;
+const YOTO_MYO_MAX_TOTAL_SECONDS = 5 * 60 * 60;
+const YOTO_MYO_MAX_TRACK_BYTES = 100 * 1024 * 1024;
+const YOTO_MYO_MAX_TRACK_SECONDS = 60 * 60;
+const MANUAL_MAX_STORAGE_MB_LIMIT = 2000;
+const MANUAL_MAX_PLAY_TIME_MINUTES_LIMIT = 60 * 60;
 const MISSING_AUDIO_DOWNLOAD_MESSAGE =
   "This story can't be downloaded because it is missing its download link in the RSS feed.";
 const MISSING_AUDIO_TECHNICAL_MESSAGE =
@@ -229,6 +236,7 @@ const allowedStoryStatuses = new Set(Object.keys(storyStatusLabels));
 const editableStoryStatuses = new Set(["discovered", "selected", "skipped", "rotated_off"]);
 const allowedNewStoryBehaviors = new Set(["auto_pick", "choose_first"]);
 const allowedPlaylistLimits = new Set([5, 10, 15, "all"]);
+const allowedCapacityModes = new Set(["yoto_max", "manual"]);
 
 const normalizeNewStoryBehavior = (value) =>
   allowedNewStoryBehaviors.has(value) ? value : "auto_pick";
@@ -239,14 +247,63 @@ const normalizePlaylistLimit = (value) => {
   return allowedPlaylistLimits.has(numericLimit) ? numericLimit : 10;
 };
 
+const clampNumber = (value, min, max, fallback) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+};
+
+const normalizeCapacityMode = (value) => allowedCapacityModes.has(value) ? value : "yoto_max";
+
+const getStoryCapacitySettings = (storyCard = {}) => {
+  if (storyCard.capacityMode) {
+    return {
+      capacityMode: normalizeCapacityMode(storyCard.capacityMode),
+      manualMaxStoriesEnabled: storyCard.manualMaxStoriesEnabled === true,
+      manualMaxStories: Math.round(clampNumber(storyCard.manualMaxStories, 1, YOTO_MYO_MAX_TRACKS, 100)),
+      manualMaxStorageEnabled: storyCard.manualMaxStorageEnabled === true,
+      manualMaxStorageMb: Math.round(clampNumber(storyCard.manualMaxStorageMb, 1, MANUAL_MAX_STORAGE_MB_LIMIT, 500)),
+      manualMaxPlayTimeEnabled: storyCard.manualMaxPlayTimeEnabled === true,
+      manualMaxPlayTimeMinutes: Math.round(clampNumber(storyCard.manualMaxPlayTimeMinutes, 1, MANUAL_MAX_PLAY_TIME_MINUTES_LIMIT, 300)),
+    };
+  }
+
+  const legacyLimit = normalizePlaylistLimit(storyCard.playlistLimit ?? "all");
+  if (legacyLimit === "all") {
+    return {
+      capacityMode: "yoto_max",
+      manualMaxStoriesEnabled: false,
+      manualMaxStories: 100,
+      manualMaxStorageEnabled: false,
+      manualMaxStorageMb: 500,
+      manualMaxPlayTimeEnabled: false,
+      manualMaxPlayTimeMinutes: 300,
+    };
+  }
+
+  return {
+    capacityMode: "manual",
+    manualMaxStoriesEnabled: true,
+    manualMaxStories: legacyLimit,
+    manualMaxStorageEnabled: false,
+    manualMaxStorageMb: 500,
+    manualMaxPlayTimeEnabled: false,
+    manualMaxPlayTimeMinutes: 300,
+  };
+};
+
 const normalizeFavoritesNeverRotate = (value) => value !== false;
 
-const withStoryQueueRuleDefaults = (storyCard) => ({
-  ...storyCard,
-  newStoryBehavior: normalizeNewStoryBehavior(storyCard?.newStoryBehavior),
-  playlistLimit: normalizePlaylistLimit(storyCard?.playlistLimit),
-  favoritesNeverRotate: normalizeFavoritesNeverRotate(storyCard?.favoritesNeverRotate),
-});
+const withStoryQueueRuleDefaults = (storyCard) => {
+  const capacitySettings = getStoryCapacitySettings(storyCard);
+  return {
+    ...storyCard,
+    newStoryBehavior: normalizeNewStoryBehavior(storyCard?.newStoryBehavior),
+    playlistLimit: normalizePlaylistLimit(storyCard?.playlistLimit),
+    ...capacitySettings,
+    favoritesNeverRotate: normalizeFavoritesNeverRotate(storyCard?.favoritesNeverRotate),
+  };
+};
 
 const isHttpUrl = (value) => {
   try {
@@ -357,6 +414,17 @@ const normalizeIsoDate = (dateValue) => {
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 };
 
+const parsePodcastDurationSeconds = (value) => {
+  const duration = String(value || "").trim();
+  if (!duration) return 0;
+  if (/^\d+$/.test(duration)) return Number(duration);
+
+  const parts = duration.split(":").map((part) => Number(part));
+  if (!parts.length || parts.some((part) => !Number.isFinite(part))) return 0;
+
+  return parts.reduce((total, part) => total * 60 + part, 0);
+};
+
 const getPodcastImageUrl = (channelXml) => {
   const itunesImage = getXmlTagAttribute(channelXml, "image", "href", { allowPrefix: true });
   const imageXml = extractXmlBlocks(channelXml, "image")[0] || "";
@@ -376,9 +444,11 @@ const getPodcastChannelXml = (xml) => {
 const getEpisodeAudio = (itemXml) => {
   const audioUrl = getXmlTagAttribute(itemXml, "enclosure", "url");
   const audioType = getXmlTagAttribute(itemXml, "enclosure", "type");
+  const contentLength = Number(getXmlTagAttribute(itemXml, "enclosure", "length") || 0);
   return {
     audioUrl: isHttpUrl(audioUrl) ? audioUrl : "",
     audioType: audioType || "",
+    contentLength: Number.isFinite(contentLength) ? contentLength : 0,
   };
 };
 
@@ -396,6 +466,8 @@ const parsePodcastEpisodes = (channelXml) =>
       guid: getXmlTagText(itemXml, "guid"),
       audioUrl: audio.audioUrl,
       audioType: audio.audioType,
+      contentLength: audio.contentLength,
+      estimatedDuration: parsePodcastDurationSeconds(getXmlTagText(itemXml, "duration", { allowPrefix: true })),
     };
   });
 
@@ -618,6 +690,7 @@ const validateStoryCardInput = (body, { requirePlaylist = true } = {}) => {
 const normalizeStoryCard = (body, existingCard = {}) => {
   const now = new Date().toISOString();
   const automaticChecksEnabled = normalizeAutomaticChecksEnabled(body, existingCard);
+  const capacitySettings = getStoryCapacitySettings({ ...existingCard, ...body });
   const updateRhythm = String(
     body.updateRhythm || existingCard.updateRhythm || (automaticChecksEnabled ? "daily" : "manual")
   ).trim();
@@ -665,6 +738,13 @@ const normalizeStoryCard = (body, existingCard = {}) => {
       body.newStoryBehavior ?? existingCard.newStoryBehavior
     ),
     playlistLimit: normalizePlaylistLimit(body.playlistLimit ?? existingCard.playlistLimit),
+    capacityMode: capacitySettings.capacityMode,
+    manualMaxStoriesEnabled: capacitySettings.manualMaxStoriesEnabled,
+    manualMaxStories: capacitySettings.manualMaxStories,
+    manualMaxStorageEnabled: capacitySettings.manualMaxStorageEnabled,
+    manualMaxStorageMb: capacitySettings.manualMaxStorageMb,
+    manualMaxPlayTimeEnabled: capacitySettings.manualMaxPlayTimeEnabled,
+    manualMaxPlayTimeMinutes: capacitySettings.manualMaxPlayTimeMinutes,
     favoritesNeverRotate: normalizeFavoritesNeverRotate(
       body.favoritesNeverRotate ?? existingCard.favoritesNeverRotate
     ),
@@ -952,6 +1032,135 @@ const markMissingAudioStoriesForStoryCard = async (storyCardId) => {
 
 const getStoryQueueForStoryCard = async (storyCardId) => markMissingAudioStoriesForStoryCard(storyCardId);
 
+const getStoryCapacityFileSize = (story = {}) =>
+  Number(story.yotoFileSize || story.fileSize || story.contentLength || story.lastPrepareContentLength || 0);
+
+const getStoryCapacityDuration = (story = {}) => Number(story.yotoDuration || story.estimatedDuration || 0);
+
+const getEmptyPlaylistCapacity = () => ({
+  tracks: 0,
+  fileSize: 0,
+  duration: 0,
+  unknownSizeCount: 0,
+  unknownDurationCount: 0,
+});
+
+const getPlaylistCapacityLimits = (storyCard = {}) => {
+  const settings = getStoryCapacitySettings(storyCard);
+  const baseLimits = {
+    capacityMode: settings.capacityMode,
+    maxTracks: YOTO_MYO_MAX_TRACKS,
+    maxStorageBytes: null,
+    maxStorageMb: null,
+    maxPlayTimeSeconds: null,
+    maxPlayTimeMinutes: null,
+    manualMaxStoriesEnabled: false,
+    manualMaxStorageEnabled: false,
+    manualMaxPlayTimeEnabled: false,
+  };
+
+  if (settings.capacityMode === "manual") {
+    return {
+      ...baseLimits,
+      maxTracks: settings.manualMaxStoriesEnabled ? settings.manualMaxStories : YOTO_MYO_MAX_TRACKS,
+      maxStorageBytes: settings.manualMaxStorageEnabled ? settings.manualMaxStorageMb * 1024 * 1024 : null,
+      maxStorageMb: settings.manualMaxStorageEnabled ? settings.manualMaxStorageMb : null,
+      maxPlayTimeSeconds: settings.manualMaxPlayTimeEnabled ? settings.manualMaxPlayTimeMinutes * 60 : null,
+      maxPlayTimeMinutes: settings.manualMaxPlayTimeEnabled ? settings.manualMaxPlayTimeMinutes : null,
+      manualMaxStoriesEnabled: settings.manualMaxStoriesEnabled,
+      manualMaxStorageEnabled: settings.manualMaxStorageEnabled,
+      manualMaxPlayTimeEnabled: settings.manualMaxPlayTimeEnabled,
+    };
+  }
+
+  return {
+    ...baseLimits,
+    maxTracks: YOTO_MYO_MAX_TRACKS,
+    maxStorageBytes: YOTO_MYO_MAX_TOTAL_BYTES,
+    maxStorageMb: 500,
+    maxPlayTimeSeconds: YOTO_MYO_MAX_TOTAL_SECONDS,
+    maxPlayTimeMinutes: 300,
+  };
+};
+
+const getStoryCapacityReason = (story, capacity, limits) => {
+  const fileSize = getStoryCapacityFileSize(story);
+  const duration = getStoryCapacityDuration(story);
+
+  if (capacity.tracks >= YOTO_MYO_MAX_TRACKS) return "track_limit";
+  if (capacity.tracks >= limits.maxTracks) return limits.capacityMode === "manual" ? "manual_story_count" : "track_limit";
+  if (fileSize > YOTO_MYO_MAX_TRACK_BYTES) return "track_file_size";
+  if (duration > YOTO_MYO_MAX_TRACK_SECONDS) return "track_duration";
+  if (limits.maxStorageBytes && !fileSize) return "unknown_file_size";
+  if (limits.maxPlayTimeSeconds && !duration) return "unknown_duration";
+  if (limits.maxStorageBytes && capacity.fileSize + fileSize > limits.maxStorageBytes) {
+    return limits.capacityMode === "manual" ? "manual_storage" : "card_file_size";
+  }
+  if (limits.maxPlayTimeSeconds && capacity.duration + duration > limits.maxPlayTimeSeconds) {
+    return limits.capacityMode === "manual" ? "manual_play_time" : "card_duration";
+  }
+  return "";
+};
+
+const addStoryToPlaylistCapacity = (capacity, story) => {
+  const fileSize = getStoryCapacityFileSize(story);
+  const duration = getStoryCapacityDuration(story);
+
+  return {
+    tracks: capacity.tracks + 1,
+    fileSize: capacity.fileSize + fileSize,
+    duration: capacity.duration + duration,
+    unknownSizeCount: capacity.unknownSizeCount + (fileSize ? 0 : 1),
+    unknownDurationCount: capacity.unknownDurationCount + (duration ? 0 : 1),
+  };
+};
+
+const applyPlaylistCapacityLimits = (stories = [], rules = {}) => {
+  const limits = getPlaylistCapacityLimits(rules);
+  let capacity = getEmptyPlaylistCapacity();
+  const included = [];
+  const overflow = [];
+  const warnings = [];
+
+  stories.forEach((story) => {
+    const capacityReason = getStoryCapacityReason(story, capacity, limits);
+    if (capacityReason) {
+      if (story.isPinned && rules.favoritesNeverRotate && !["track_limit", "track_file_size", "track_duration", "unknown_file_size", "unknown_duration"].includes(capacityReason)) {
+        warnings.push("favorites_exceed_limits");
+        included.push({ ...story, capacityWarning: capacityReason });
+        capacity = addStoryToPlaylistCapacity(capacity, story);
+        return;
+      }
+
+      overflow.push({ ...story, capacityReason });
+      return;
+    }
+
+    included.push(story);
+    capacity = addStoryToPlaylistCapacity(capacity, story);
+  });
+
+  return { included, overflow, capacity, limits, warnings: [...new Set(warnings)] };
+};
+
+const getCapacityLimitMessage = (reason, limits = {}) => {
+  if (reason === "track_limit") return "Yoto track limit reached.";
+  if (limits.capacityMode === "manual" || String(reason || "").startsWith("manual_")) {
+    return "Manual playlist limit reached.";
+  }
+  return "Max Yoto setting reached.";
+};
+
+const getSafeCapacityDetails = (storyCard = {}, capacity = getEmptyPlaylistCapacity(), limits = {}) => ({
+  capacityMode: limits.capacityMode || storyCard.capacityMode || "yoto_max",
+  trackCount: Number(capacity.tracks || 0),
+  maxTracks: Number(limits.maxTracks || YOTO_MYO_MAX_TRACKS),
+  totalFileSizeMb: Number((Number(capacity.fileSize || 0) / (1024 * 1024)).toFixed(1)),
+  ...(limits.maxStorageMb ? { maxStorageMb: Number(limits.maxStorageMb) } : {}),
+  totalDurationMinutes: Math.round(Number(capacity.duration || 0) / 60),
+  ...(limits.maxPlayTimeMinutes ? { maxPlayTimeMinutes: Number(limits.maxPlayTimeMinutes) } : {}),
+});
+
 const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
   const rules = withStoryQueueRuleDefaults(storyCard);
   const sortedStories = sortQueuedStories(queuedStories);
@@ -1006,9 +1215,9 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
     return new Date(secondDate).getTime() - new Date(firstDate).getTime();
   });
 
-  const limit = rules.playlistLimit === "all" ? prioritizedCandidates.length : rules.playlistLimit;
-  const onYotoSoon = prioritizedCandidates.slice(0, limit);
-  const oldStoriesResting = [...prioritizedCandidates.slice(limit), ...oldStoryCandidates];
+  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules);
+  const onYotoSoon = capacityPreview.included;
+  const oldStoriesResting = [...capacityPreview.overflow, ...oldStoryCandidates];
 
   return {
     onYotoSoon,
@@ -1022,6 +1231,9 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
       favoriteCount: favorites.length,
       skippedCount: skippedStories.length,
       oldStoryCount: oldStoriesResting.length,
+      capacity: capacityPreview.capacity,
+      capacityLimits: capacityPreview.limits,
+      capacityWarnings: capacityPreview.warnings,
     },
   };
 };
@@ -1051,6 +1263,8 @@ const normalizeQueuedStory = (storyCardId, story, existingStory = {}) => {
     guid: String(story.guid ?? existingStory.guid ?? "").trim(),
     audioUrl: isHttpUrl(audioUrl) ? audioUrl : "",
     audioType: String(story.audioType ?? existingStory.audioType ?? "").trim(),
+    contentLength: Number(story.contentLength || existingStory.contentLength || 0),
+    estimatedDuration: Number(story.estimatedDuration || existingStory.estimatedDuration || 0),
     resolvedAudioUrl: String(existingStory.resolvedAudioUrl || "").trim(),
     resolvedAudioUrlHost: String(existingStory.resolvedAudioUrlHost || "").trim(),
     audioUrlHost: String(existingStory.audioUrlHost || "").trim(),
@@ -1199,7 +1413,18 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
       throw createExposedError("This story needs an audio file before it can be added back.");
     }
 
-    const limit = storyCard.playlistLimit === "all" ? Infinity : Number(storyCard.playlistLimit || 10);
+    const storyCapacityReason = getStoryCapacityReason(nextStory, getEmptyPlaylistCapacity(), getPlaylistCapacityLimits({
+      ...storyCard,
+      capacityMode: "manual",
+      manualMaxStoriesEnabled: false,
+      manualMaxStorageEnabled: false,
+      manualMaxPlayTimeEnabled: false,
+    }));
+    if (storyCapacityReason) {
+      throw createExposedError("This story is resting until Feed Your Yoto knows it will fit on the Yoto card.");
+    }
+
+    const limit = Number(getPlaylistCapacityLimits(storyCard).maxTracks || YOTO_MYO_MAX_TRACKS);
     const currentLineup = beforePreview?.onYotoSoon || [];
     const alreadyInLineup = currentLineup.some((story) => story.id === nextStory.id);
 
@@ -2086,7 +2311,7 @@ const fetchStoryAudioToFile = async (audioUrl, storyCardId, storyId, redirectCou
 };
 
 const downloadStoryAudio = async (storyCardId, storyId) => {
-  await getStoryCardOrThrow(storyCardId);
+  const { storyCard } = await getStoryCardOrThrow(storyCardId);
 
   const storyQueue = await readStoryQueue();
   const story = storyQueue.find((item) => item.storyCardId === storyCardId && item.id === storyId);
@@ -2144,6 +2369,12 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
   const allowedDownloadStatuses = new Set(["selected", "discovered", "downloaded", "failed"]);
   if (!allowedDownloadStatuses.has(story.status)) {
     throw createExposedError("Pick this Story for Yoto before getting it ready.");
+  }
+
+  const preview = getPlaylistPreviewForStoryCard(storyCard, await getStoryQueueForStoryCard(storyCardId));
+  const inCapacityApprovedLineup = preview.onYotoSoon.some((item) => item.id === storyId);
+  if (!inCapacityApprovedLineup) {
+    throw createExposedError("This story is resting until Feed Your Yoto knows it will fit on the Yoto card.");
   }
 
   const startDetails = getSafePrepareDetails({ step: "Getting story ready" }, story);
@@ -2229,12 +2460,25 @@ const downloadSelectedStories = async (storyCardId) => {
   const { storyCard } = await getStoryCardOrThrow(storyCardId);
   const queuedStories = await getStoryQueueForStoryCard(storyCardId);
   const preview = getPlaylistPreviewForStoryCard(storyCard, queuedStories);
-  const candidateIds = new Set([
-    ...queuedStories
-      .filter((story) => story.isSelected || story.status === "selected")
-      .map((story) => story.id),
-    ...preview.onYotoSoon.map((story) => story.id),
-  ]);
+  const selectedCapacityOverflow = (preview.oldStoriesResting || []).filter((story) =>
+    story.capacityReason && (story.isSelected || story.status === "selected")
+  );
+  for (const story of selectedCapacityOverflow) {
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId: story.id,
+      eventType: "story_capacity_limit_reached",
+      title: "Playlist capacity reached",
+      message: "Story was not added because the playlist is full.",
+      details: {
+        ...getSafeCapacityDetails(storyCard, preview.summary?.capacity, preview.summary?.capacityLimits),
+        reason: story.capacityReason,
+        friendlyMessage: getCapacityLimitMessage(story.capacityReason, preview.summary?.capacityLimits),
+      },
+    });
+  }
+  const candidateIds = new Set(preview.onYotoSoon.map((story) => story.id));
   const downloaded = [];
   const failed = [];
 
@@ -3392,6 +3636,55 @@ const getYotoTrackTotals = (tracks = []) =>
     { duration: 0, fileSize: 0 }
   );
 
+const getYotoPlaylistCapacityProblems = (tracks = [], limits = getPlaylistCapacityLimits()) => {
+  const problems = [];
+  const totals = getYotoTrackTotals(tracks);
+
+  if (tracks.length > YOTO_MYO_MAX_TRACKS) problems.push("track_limit");
+  if (tracks.length > Number(limits.maxTracks || YOTO_MYO_MAX_TRACKS)) problems.push("selected_track_limit");
+  if (limits.maxStorageBytes && totals.fileSize > limits.maxStorageBytes) {
+    problems.push(limits.capacityMode === "manual" ? "manual_storage" : "card_file_size");
+  }
+  if (limits.maxPlayTimeSeconds && totals.duration > limits.maxPlayTimeSeconds) {
+    problems.push(limits.capacityMode === "manual" ? "manual_play_time" : "card_duration");
+  }
+
+  tracks.forEach((track, index) => {
+    if (Number(track.fileSize || 0) > YOTO_MYO_MAX_TRACK_BYTES) {
+      problems.push(`track_${index + 1}_file_size`);
+    }
+    if (Number(track.duration || 0) > YOTO_MYO_MAX_TRACK_SECONDS) {
+      problems.push(`track_${index + 1}_duration`);
+    }
+  });
+
+  return { problems, totals };
+};
+
+const assertYotoPlaylistTracksWithinCapacity = (tracks = [], storyCard = {}) => {
+  const limits = getPlaylistCapacityLimits(storyCard);
+  const { problems, totals } = getYotoPlaylistCapacityProblems(tracks, limits);
+  if (!problems.length) return;
+
+  throw createYotoPlaylistUpdateError("This Story Playlist is too full for the selected capacity settings.", 400, {
+    step: "Checking Story Playlist Capacity",
+    failureType: "playlist_payload_error",
+    storyCardId: storyCard.id,
+    yotoPlaylistId: storyCard.yotoPlaylistId,
+    yotoPlaylistTitle: storyCard.yotoPlaylistTitle,
+    trackCount: tracks.length,
+    fileSize: totals.fileSize,
+    duration: totals.duration,
+    capacityProblems: problems,
+    ...getSafeCapacityDetails(storyCard, {
+      tracks: tracks.length,
+      fileSize: totals.fileSize,
+      duration: totals.duration,
+    }, limits),
+    technicalMessage: "Playlist tracks exceeded the configured Story Playlist capacity limits.",
+  });
+};
+
 const getMissingYotoTrackMetadataFields = (story = {}) => {
   const missing = [];
   if (!String(story.title || "").trim()) missing.push("title");
@@ -3786,6 +4079,7 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
 
   try {
     const { card, tokens } = await getYotoPlaylistContent(storyCard);
+    assertYotoPlaylistTracksWithinCapacity(tracks, storyCard);
     const updatePayload = buildYotoPlaylistUpdatePayload(card, storyCard, tracks);
     const response = await postYotoJsonWithRefresh("/content", tokens, updatePayload);
     const responseShape = getSafeYotoResponseShape(response.data);

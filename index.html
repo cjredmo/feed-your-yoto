@@ -203,6 +203,40 @@
                   <p><strong>Manual Picking:</strong> You choose which stories go on the playlist.</p>
                 </div>
               </div>
+
+              <div class="story-rule-group" aria-labelledby="playlistCapacityRuleLabel">
+                <p id="playlistCapacityRuleLabel">Playlist capacity</p>
+                <div class="segmented-control compact-segments">
+                  <button class="segment is-selected" type="button" data-capacity-mode="yoto_max">Max Yoto settings</button>
+                  <button class="segment" type="button" data-capacity-mode="manual">Manually set max</button>
+                </div>
+                <div class="story-rule-help">
+                  <p><strong>Max Yoto settings:</strong> Feed Your Yoto will follow Yoto's recommended playlist limits: 100 tracks, 500 MB, or 5 hours.</p>
+                  <p><strong>Manually set max:</strong> Set your own storage or play time limits. Track count is always capped at 100.</p>
+                </div>
+
+                <div id="manualCapacityControls" class="manual-capacity-controls" hidden>
+                  <label class="capacity-limit-row">
+                    <input id="manualMaxStoriesEnabled" type="checkbox" />
+                    <span>Max stories</span>
+                    <input id="manualMaxStories" type="number" min="1" max="100" step="1" value="100" />
+                  </label>
+                  <label class="capacity-limit-row">
+                    <input id="manualMaxStorageEnabled" type="checkbox" />
+                    <span>Max storage</span>
+                    <input id="manualMaxStorageMb" type="number" min="1" max="2000" step="1" value="500" />
+                    <small>MB</small>
+                  </label>
+                  <label class="capacity-limit-row">
+                    <input id="manualMaxPlayTimeEnabled" type="checkbox" />
+                    <span>Max play time</span>
+                    <input id="manualMaxPlayTimeHours" type="number" min="0" max="60" step="1" value="5" />
+                    <small>hr</small>
+                    <input id="manualMaxPlayTimeMinutes" type="number" min="0" max="59" step="1" value="0" />
+                    <small>min</small>
+                  </label>
+                </div>
+              </div>
             </section>
           </div>
 

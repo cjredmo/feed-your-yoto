@@ -47,6 +47,13 @@ const STORY_QUEUE_FAST_POLL_MS = 3_000;
 const STORY_QUEUE_WAITING_POLL_MS = 5_000;
 const STORY_QUEUE_SLOW_POLL_MS = 15_000;
 const STORY_QUEUE_SLOW_AFTER_UNCHANGED_POLLS = 24;
+const YOTO_MYO_MAX_TRACKS = 100;
+const YOTO_MYO_MAX_TOTAL_BYTES = 500 * 1024 * 1024;
+const YOTO_MYO_MAX_TOTAL_SECONDS = 5 * 60 * 60;
+const YOTO_MYO_MAX_TRACK_BYTES = 100 * 1024 * 1024;
+const YOTO_MYO_MAX_TRACK_SECONDS = 60 * 60;
+const MANUAL_MAX_STORAGE_MB_LIMIT = 2000;
+const MANUAL_MAX_PLAY_TIME_MINUTES_LIMIT = 60 * 60;
 
 const storyStatusLabels = {
   discovered: "New story found",
@@ -75,6 +82,13 @@ const STORY_TRACKER_STEP_SPACING = 46;
 const defaultStoryRules = {
   newStoryBehavior: "auto_pick",
   playlistLimit: 10,
+  capacityMode: "yoto_max",
+  manualMaxStoriesEnabled: false,
+  manualMaxStories: 100,
+  manualMaxStorageEnabled: false,
+  manualMaxStorageMb: 500,
+  manualMaxPlayTimeEnabled: false,
+  manualMaxPlayTimeMinutes: 300,
   favoritesNeverRotate: true,
 };
 
@@ -143,6 +157,15 @@ const refreshStories = document.querySelector("#refreshStories");
 const storyQueueContent = document.querySelector("#storyQueueContent");
 const favoritesNeverRotate = document.querySelector("#favoritesNeverRotate");
 const newStoryBehaviorButtons = Array.from(document.querySelectorAll("[data-new-story-behavior]"));
+const capacityModeButtons = Array.from(document.querySelectorAll("[data-capacity-mode]"));
+const manualCapacityControls = document.querySelector("#manualCapacityControls");
+const manualMaxStoriesEnabled = document.querySelector("#manualMaxStoriesEnabled");
+const manualMaxStories = document.querySelector("#manualMaxStories");
+const manualMaxStorageEnabled = document.querySelector("#manualMaxStorageEnabled");
+const manualMaxStorageMb = document.querySelector("#manualMaxStorageMb");
+const manualMaxPlayTimeEnabled = document.querySelector("#manualMaxPlayTimeEnabled");
+const manualMaxPlayTimeHours = document.querySelector("#manualMaxPlayTimeHours");
+const manualMaxPlayTimeMinutes = document.querySelector("#manualMaxPlayTimeMinutes");
 const editorTabs = Array.from(document.querySelectorAll("[data-editor-tab]"));
 const editorPanels = Array.from(document.querySelectorAll("[data-editor-panel]"));
 const storySubtabs = Array.from(document.querySelectorAll("[data-stories-subtab]"));
@@ -839,11 +862,57 @@ const normalizePlaylistLimitValue = (value) => {
   return [5, 10, 15].includes(numericValue) ? numericValue : 10;
 };
 
+const clampNumber = (value, min, max, fallback) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+};
+
+const normalizeCapacityMode = (value) => value === "manual" ? "manual" : "yoto_max";
+
+const getMigratedCapacitySettings = (storyCard = {}) => {
+  if (storyCard.capacityMode) {
+    return {
+      capacityMode: normalizeCapacityMode(storyCard.capacityMode),
+      manualMaxStoriesEnabled: storyCard.manualMaxStoriesEnabled === true,
+      manualMaxStories: clampNumber(storyCard.manualMaxStories, 1, YOTO_MYO_MAX_TRACKS, defaultStoryRules.manualMaxStories),
+      manualMaxStorageEnabled: storyCard.manualMaxStorageEnabled === true,
+      manualMaxStorageMb: clampNumber(storyCard.manualMaxStorageMb, 1, MANUAL_MAX_STORAGE_MB_LIMIT, defaultStoryRules.manualMaxStorageMb),
+      manualMaxPlayTimeEnabled: storyCard.manualMaxPlayTimeEnabled === true,
+      manualMaxPlayTimeMinutes: clampNumber(storyCard.manualMaxPlayTimeMinutes, 1, MANUAL_MAX_PLAY_TIME_MINUTES_LIMIT, defaultStoryRules.manualMaxPlayTimeMinutes),
+    };
+  }
+
+  const legacyLimit = normalizePlaylistLimitValue(storyCard.playlistLimit ?? "all");
+  if (legacyLimit === "all") {
+    return {
+      capacityMode: "yoto_max",
+      manualMaxStoriesEnabled: false,
+      manualMaxStories: defaultStoryRules.manualMaxStories,
+      manualMaxStorageEnabled: false,
+      manualMaxStorageMb: defaultStoryRules.manualMaxStorageMb,
+      manualMaxPlayTimeEnabled: false,
+      manualMaxPlayTimeMinutes: defaultStoryRules.manualMaxPlayTimeMinutes,
+    };
+  }
+
+  return {
+    capacityMode: "manual",
+    manualMaxStoriesEnabled: true,
+    manualMaxStories: legacyLimit,
+    manualMaxStorageEnabled: false,
+    manualMaxStorageMb: defaultStoryRules.manualMaxStorageMb,
+    manualMaxPlayTimeEnabled: false,
+    manualMaxPlayTimeMinutes: defaultStoryRules.manualMaxPlayTimeMinutes,
+  };
+};
+
 const getStoryRules = (storyCard = {}) => ({
   newStoryBehavior: ["auto_pick", "choose_first"].includes(storyCard.newStoryBehavior)
     ? storyCard.newStoryBehavior
     : defaultStoryRules.newStoryBehavior,
   playlistLimit: normalizePlaylistLimitValue(storyCard.playlistLimit ?? defaultStoryRules.playlistLimit),
+  ...getMigratedCapacitySettings(storyCard),
   favoritesNeverRotate: storyCard.favoritesNeverRotate !== false,
 });
 
@@ -851,10 +920,34 @@ const getEditorStoryRules = () => {
   const selectedBehavior = newStoryBehaviorButtons.find((button) =>
     button.classList.contains("is-selected")
   );
+  const selectedCapacityMode = capacityModeButtons.find((button) =>
+    button.classList.contains("is-selected")
+  );
+  const maxStoriesValue = clampNumber(manualMaxStories?.value, 1, YOTO_MYO_MAX_TRACKS, defaultStoryRules.manualMaxStories);
+  const maxStorageValue = clampNumber(manualMaxStorageMb?.value, 1, MANUAL_MAX_STORAGE_MB_LIMIT, defaultStoryRules.manualMaxStorageMb);
+  const playTimeHours = clampNumber(manualMaxPlayTimeHours?.value, 0, 60, 0);
+  const playTimeMinuteRemainder = clampNumber(manualMaxPlayTimeMinutes?.value, 0, 59, 0);
+  const maxPlayTimeValue = clampNumber(
+    playTimeHours * 60 + playTimeMinuteRemainder,
+    1,
+    MANUAL_MAX_PLAY_TIME_MINUTES_LIMIT,
+    defaultStoryRules.manualMaxPlayTimeMinutes
+  );
 
   return {
     newStoryBehavior: selectedBehavior?.dataset.newStoryBehavior || defaultStoryRules.newStoryBehavior,
-    playlistLimit: defaultStoryRules.playlistLimit,
+    capacityMode: normalizeCapacityMode(selectedCapacityMode?.dataset.capacityMode),
+    manualMaxStoriesEnabled: Boolean(manualMaxStoriesEnabled?.checked),
+    manualMaxStories: Math.round(maxStoriesValue),
+    manualMaxStorageEnabled: Boolean(manualMaxStorageEnabled?.checked),
+    manualMaxStorageMb: Math.round(maxStorageValue),
+    manualMaxPlayTimeEnabled: Boolean(manualMaxPlayTimeEnabled?.checked),
+    manualMaxPlayTimeMinutes: Math.round(maxPlayTimeValue),
+    playlistLimit: normalizeCapacityMode(selectedCapacityMode?.dataset.capacityMode) === "manual" &&
+      Boolean(manualMaxStoriesEnabled?.checked) &&
+      [5, 10, 15].includes(Math.round(maxStoriesValue))
+        ? Math.round(maxStoriesValue)
+        : "all",
     favoritesNeverRotate: true,
   };
 };
@@ -865,6 +958,18 @@ const setStoryRules = (storyCard = {}) => {
   newStoryBehaviorButtons.forEach((button) => {
     button.classList.toggle("is-selected", button.dataset.newStoryBehavior === rules.newStoryBehavior);
   });
+
+  capacityModeButtons.forEach((button) => {
+    button.classList.toggle("is-selected", button.dataset.capacityMode === rules.capacityMode);
+  });
+  if (manualCapacityControls) manualCapacityControls.hidden = rules.capacityMode !== "manual";
+  if (manualMaxStoriesEnabled) manualMaxStoriesEnabled.checked = rules.manualMaxStoriesEnabled;
+  if (manualMaxStories) manualMaxStories.value = String(rules.manualMaxStories);
+  if (manualMaxStorageEnabled) manualMaxStorageEnabled.checked = rules.manualMaxStorageEnabled;
+  if (manualMaxStorageMb) manualMaxStorageMb.value = String(rules.manualMaxStorageMb);
+  if (manualMaxPlayTimeEnabled) manualMaxPlayTimeEnabled.checked = rules.manualMaxPlayTimeEnabled;
+  if (manualMaxPlayTimeHours) manualMaxPlayTimeHours.value = String(Math.floor(rules.manualMaxPlayTimeMinutes / 60));
+  if (manualMaxPlayTimeMinutes) manualMaxPlayTimeMinutes.value = String(rules.manualMaxPlayTimeMinutes % 60);
 };
 
 const setStoriesSubtab = (tabName = "queue") => {
@@ -888,6 +993,117 @@ const getStorySortValue = (story) => {
 
 const sortPreviewStories = (stories) =>
   stories.slice().sort((first, second) => getStorySortValue(second) - getStorySortValue(first));
+
+const getStoryCapacityFileSize = (story) =>
+  Number(story?.yotoFileSize || story?.fileSize || story?.contentLength || story?.lastPrepareContentLength || 0);
+
+const getStoryCapacityDuration = (story) => Number(story?.yotoDuration || story?.estimatedDuration || 0);
+
+const getEmptyPlaylistCapacity = () => ({
+  tracks: 0,
+  fileSize: 0,
+  duration: 0,
+  unknownSizeCount: 0,
+  unknownDurationCount: 0,
+});
+
+const getPlaylistCapacityLimits = (rules = {}) => {
+  const settings = getMigratedCapacitySettings(rules);
+  const baseLimits = {
+    capacityMode: settings.capacityMode,
+    maxTracks: YOTO_MYO_MAX_TRACKS,
+    maxStorageBytes: null,
+    maxStorageMb: null,
+    maxPlayTimeSeconds: null,
+    maxPlayTimeMinutes: null,
+    manualMaxStoriesEnabled: false,
+    manualMaxStorageEnabled: false,
+    manualMaxPlayTimeEnabled: false,
+  };
+
+  if (settings.capacityMode === "manual") {
+    return {
+      ...baseLimits,
+      maxTracks: settings.manualMaxStoriesEnabled ? settings.manualMaxStories : YOTO_MYO_MAX_TRACKS,
+      maxStorageBytes: settings.manualMaxStorageEnabled ? settings.manualMaxStorageMb * 1024 * 1024 : null,
+      maxStorageMb: settings.manualMaxStorageEnabled ? settings.manualMaxStorageMb : null,
+      maxPlayTimeSeconds: settings.manualMaxPlayTimeEnabled ? settings.manualMaxPlayTimeMinutes * 60 : null,
+      maxPlayTimeMinutes: settings.manualMaxPlayTimeEnabled ? settings.manualMaxPlayTimeMinutes : null,
+      manualMaxStoriesEnabled: settings.manualMaxStoriesEnabled,
+      manualMaxStorageEnabled: settings.manualMaxStorageEnabled,
+      manualMaxPlayTimeEnabled: settings.manualMaxPlayTimeEnabled,
+    };
+  }
+
+  return {
+    ...baseLimits,
+    maxTracks: YOTO_MYO_MAX_TRACKS,
+    maxStorageBytes: YOTO_MYO_MAX_TOTAL_BYTES,
+    maxStorageMb: 500,
+    maxPlayTimeSeconds: YOTO_MYO_MAX_TOTAL_SECONDS,
+    maxPlayTimeMinutes: 300,
+  };
+};
+
+const getStoryCapacityReason = (story, capacity, limits) => {
+  const fileSize = getStoryCapacityFileSize(story);
+  const duration = getStoryCapacityDuration(story);
+
+  if (capacity.tracks >= YOTO_MYO_MAX_TRACKS) return "track_limit";
+  if (capacity.tracks >= limits.maxTracks) return limits.capacityMode === "manual" ? "manual_story_count" : "track_limit";
+  if (fileSize > YOTO_MYO_MAX_TRACK_BYTES) return "track_file_size";
+  if (duration > YOTO_MYO_MAX_TRACK_SECONDS) return "track_duration";
+  if (limits.maxStorageBytes && !fileSize) return "unknown_file_size";
+  if (limits.maxPlayTimeSeconds && !duration) return "unknown_duration";
+  if (limits.maxStorageBytes && capacity.fileSize + fileSize > limits.maxStorageBytes) {
+    return limits.capacityMode === "manual" ? "manual_storage" : "card_file_size";
+  }
+  if (limits.maxPlayTimeSeconds && capacity.duration + duration > limits.maxPlayTimeSeconds) {
+    return limits.capacityMode === "manual" ? "manual_play_time" : "card_duration";
+  }
+  return "";
+};
+
+const addStoryToPlaylistCapacity = (capacity, story) => {
+  const fileSize = getStoryCapacityFileSize(story);
+  const duration = getStoryCapacityDuration(story);
+
+  return {
+    tracks: capacity.tracks + 1,
+    fileSize: capacity.fileSize + fileSize,
+    duration: capacity.duration + duration,
+    unknownSizeCount: capacity.unknownSizeCount + (fileSize ? 0 : 1),
+    unknownDurationCount: capacity.unknownDurationCount + (duration ? 0 : 1),
+  };
+};
+
+const applyPlaylistCapacityLimits = (stories, rules) => {
+  const limits = getPlaylistCapacityLimits(rules);
+  let capacity = getEmptyPlaylistCapacity();
+  const included = [];
+  const overflow = [];
+  const warnings = [];
+
+  stories.forEach((story) => {
+    const capacityReason = getStoryCapacityReason(story, capacity, limits);
+    if (capacityReason) {
+      if (story.isPinned && rules.favoritesNeverRotate && !["track_limit", "track_file_size", "track_duration", "unknown_file_size", "unknown_duration"].includes(capacityReason)) {
+        warnings.push("favorites_exceed_limits");
+        included.push({ ...story, capacityWarning: capacityReason });
+        capacity = addStoryToPlaylistCapacity(capacity, story);
+        return;
+      }
+
+      overflow.push({ ...story, capacityReason });
+      return;
+    }
+
+    included.push(story);
+    capacity = addStoryToPlaylistCapacity(capacity, story);
+  });
+
+  return { included, overflow, capacity, limits, warnings: [...new Set(warnings)] };
+};
 
 const storyStatusesWithPreparedAudio = new Set([
   "downloaded",
@@ -972,11 +1188,20 @@ const getPlaylistPreview = (rules, stories) => {
     return getStorySortValue(second) - getStorySortValue(first);
   });
 
-  const limit = rules.playlistLimit === "all" ? prioritizedCandidates.length : rules.playlistLimit;
-  const onYotoSoon = prioritizedCandidates.slice(0, limit);
-  const oldStoriesResting = [...prioritizedCandidates.slice(limit), ...oldStoryCandidates];
+  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules);
+  const onYotoSoon = capacityPreview.included;
+  const oldStoriesResting = [...capacityPreview.overflow, ...oldStoryCandidates];
 
-  return { onYotoSoon, newStories, skippedStories, oldStoriesResting, favorites };
+  return {
+    onYotoSoon,
+    newStories,
+    skippedStories,
+    oldStoriesResting,
+    favorites,
+    capacity: capacityPreview.capacity,
+    capacityLimits: capacityPreview.limits,
+    capacityWarnings: capacityPreview.warnings,
+  };
 };
 
 const getStoryQueueLastChecked = () => {
@@ -1238,12 +1463,86 @@ const getStoriesReadyToSync = (stories) => (stories || []).filter(isStoryReadyTo
 const getStoriesWaitingForYoto = (stories) =>
   (stories || []).filter((story) => isStoryWaitingForPlaylist(story));
 
+const formatDuration = (secondsValue) => {
+  const totalSeconds = Number(secondsValue || 0);
+  if (!totalSeconds) return "";
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.round((totalSeconds % 3600) / 60);
+  if (hours && minutes) return `${hours} hr ${minutes} min`;
+  if (hours) return `${hours} hr`;
+  return `${minutes || 1} min`;
+};
+
+const renderPlaylistCapacityMeter = (preview) => {
+  const capacity = preview.capacity || getEmptyPlaylistCapacity();
+  const limits = preview.capacityLimits || getPlaylistCapacityLimits(getEditorStoryRules());
+  const trackLimit = limits.maxTracks || YOTO_MYO_MAX_TRACKS;
+  const storageLimit = limits.maxStorageBytes;
+  const playTimeLimit = limits.maxPlayTimeSeconds;
+  const trackPercent = Math.min(100, Math.round((capacity.tracks / trackLimit) * 100));
+  const storagePercent = storageLimit ? Math.min(100, Math.round((capacity.fileSize / storageLimit) * 100)) : 0;
+  const playTimePercent = playTimeLimit ? Math.min(100, Math.round((capacity.duration / playTimeLimit) * 100)) : 0;
+  const getTone = (percent) => percent >= 100 ? "is-full" : percent >= 80 ? "is-warning" : "";
+  const settingsText = limits.capacityMode === "manual"
+    ? "Feed Your Yoto will stop before any manual limit you turn on."
+    : "Feed Your Yoto will stop before the Story Playlist reaches Yoto's recommended limits.";
+  const warningText = preview.capacityWarnings?.includes("favorites_exceed_limits")
+    ? "Favorites exceed the selected limits, so Feed Your Yoto is keeping them and pausing new additions."
+    : [trackPercent, storagePercent, playTimePercent].some((percent) => percent >= 100)
+      ? limits.capacityMode === "manual"
+        ? "Manual playlist limit reached."
+        : "Max Yoto setting reached."
+      : "";
+  const renderRow = ({ label, value, percent, disabled = false }) => `
+    <div class="story-capacity-row ${disabled ? "is-disabled" : ""} ${getTone(percent)}">
+      <div>
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+      </div>
+      <div class="story-capacity-track" aria-hidden="true">
+        <span style="width: ${disabled ? 0 : percent}%"></span>
+      </div>
+    </div>
+  `;
+
+  return `
+    <div class="story-capacity-meter" aria-label="Story Playlist capacity">
+      <div class="story-capacity-meter-header">
+        <div>
+          <span>Playlist capacity</span>
+          <strong>Feed Your Yoto watches track count, storage, and play time.</strong>
+        </div>
+        <p>${escapeHtml(settingsText)}</p>
+      </div>
+      ${renderRow({
+        label: "Tracks",
+        value: `${capacity.tracks} / ${trackLimit} tracks`,
+        percent: trackPercent,
+      })}
+      ${renderRow({
+        label: "Storage",
+        value: storageLimit ? `${formatFileSize(capacity.fileSize) || "0 MB"} of ${formatFileSize(storageLimit)}` : `${formatFileSize(capacity.fileSize) || "0 MB"} used`,
+        percent: storagePercent,
+        disabled: !storageLimit,
+      })}
+      ${renderRow({
+        label: "Play time",
+        value: playTimeLimit ? `${formatDuration(capacity.duration) || "0 min"} of ${formatDuration(playTimeLimit)}` : `${formatDuration(capacity.duration) || "0 min"} used`,
+        percent: playTimePercent,
+        disabled: !playTimeLimit,
+      })}
+      ${warningText ? `<p class="story-capacity-warning">${escapeHtml(warningText)}</p>` : ""}
+    </div>
+  `;
+};
+
 const renderStoryStatusSummary = (preview) => {
   const storiesToPrepare = getStoriesNeedingPreparation(preview).length;
   const storiesToSend = getStoriesReadyToUpload(storyQueueState.stories).length;
   const storiesToSync = getStoriesReadyToSync(storyQueueState.stories).length;
   const storiesWaitingForYoto = getStoriesWaitingForYoto(storyQueueState.stories).length;
   const needsHelpCount = storyQueueState.stories.filter(storyNeedsHelp).length;
+  const capacityRestingCount = (preview.oldStoriesResting || []).filter((story) => story.capacityReason).length;
   const isAutomaticMode = getEditorStoryRules().newStoryBehavior !== "choose_first";
   const automaticNote = storyDownloadState.processing
     ? storyDownloadState.syncing
@@ -1259,6 +1558,8 @@ const renderStoryStatusSummary = (preview) => {
           ? "Feed Your Yoto will update the Story Playlist automatically."
           : storiesWaitingForYoto
             ? YOTO_PROCESSING_MESSAGE
+            : capacityRestingCount
+              ? "Some stories are resting until Feed Your Yoto knows they will fit."
             : "Everything picked is ready on Yoto.";
 
   return `
@@ -1274,6 +1575,7 @@ const renderStoryStatusSummary = (preview) => {
         <span><strong>${preview.favorites.length}</strong> Favorites</span>
         <span><strong>${needsHelpCount}</strong> Needs help</span>
       </div>
+      ${renderPlaylistCapacityMeter(preview)}
       ${isAutomaticMode ? `<p class="story-auto-note">${automaticNote}</p>` : renderManualPreparePanel(storiesToPrepare, storiesToSync)}
     </section>
   `;
@@ -1315,6 +1617,14 @@ const getStoryGroupFromPreview = (story, previewSets) => {
   if (previewSets.skipped.has(story.id)) return "skipped";
   return "new";
 };
+
+const getPreviewStory = (story, preview) =>
+  [
+    ...(preview.onYotoSoon || []),
+    ...(preview.newStories || []),
+    ...(preview.oldStoriesResting || []),
+    ...(preview.skippedStories || []),
+  ].find((item) => item.id === story.id) || story;
 
 const storyFilterOptions = [
   { key: "all", label: "All Stories" },
@@ -1424,7 +1734,8 @@ const renderStoryQueue = () => {
         ? `<div class="story-list">${filteredStories
             .map((story) => {
               const group = getStoryGroupFromPreview(story, previewSets);
-              return renderQueuedStory(story, group);
+              const previewStory = getPreviewStory(story, preview);
+              return renderQueuedStory({ ...story, ...previewStory }, group);
             })
             .join("")}</div>`
         : `<div class="story-queue-empty"><p>No stories match this tag yet.</p></div>`
@@ -1432,7 +1743,9 @@ const renderStoryQueue = () => {
   `;
 };
 
-const canStoryBeAddedBack = (story) => canStoryOccupyPlaylistSlot(story);
+const canStoryBeAddedBack = (story) =>
+  canStoryOccupyPlaylistSlot(story) &&
+    (!story.capacityReason || ["story_count", "manual_story_count"].includes(story.capacityReason));
 
 const getStoryControlsForGroup = (story, group) => {
   const controls = [];
@@ -1478,10 +1791,10 @@ const getStoryControlsForGroup = (story, group) => {
 
 const getStoryAddBackReplacementCandidate = (story) => {
   const rules = getEditorStoryRules();
-  if (rules.playlistLimit === "all") return null;
+  const limits = getPlaylistCapacityLimits(rules);
 
   const preview = getPlaylistPreview(rules, storyQueueState.stories);
-  const limit = Number(rules.playlistLimit || defaultStoryRules.playlistLimit);
+  const limit = Number(limits.maxTracks || YOTO_MYO_MAX_TRACKS);
   if (!Number.isFinite(limit) || preview.onYotoSoon.length < limit) return null;
 
   const candidates = preview.onYotoSoon
@@ -1491,6 +1804,33 @@ const getStoryAddBackReplacementCandidate = (story) => {
 
   if (candidates.length) return candidates[0];
   return { blocked: true };
+};
+
+const getStoryCapacityNote = (story) => {
+  switch (story?.capacityReason) {
+    case "unknown_file_size":
+      return "This story is resting until Feed Your Yoto can see its audio size.";
+    case "unknown_duration":
+      return "This story is resting until Feed Your Yoto can see its play time.";
+    case "track_file_size":
+      return "This story is resting because its audio file is too large for one Yoto track.";
+    case "track_duration":
+      return "This story is resting because it is too long for one Yoto track.";
+    case "card_file_size":
+      return "This story is resting because the Story Playlist is almost full.";
+    case "card_duration":
+      return "This story is resting because the Story Playlist is almost out of listening time.";
+    case "track_limit":
+      return "This story is resting because this Story Playlist already has the most tracks Yoto allows.";
+    case "manual_story_count":
+      return "This story is resting because your manual story limit has been reached.";
+    case "manual_storage":
+      return "This story is resting because your manual storage limit has been reached.";
+    case "manual_play_time":
+      return "This story is resting because your manual play time limit has been reached.";
+    default:
+      return "";
+  }
 };
 
 const getStoryContextMarkup = (story, group) => {
@@ -1513,7 +1853,7 @@ const getStoryContextMarkup = (story, group) => {
 
   if (isStoryMissingRssAudio(story)) return `<p class="story-note">${escapeHtml(MISSING_AUDIO_PARENT_MESSAGE)}</p>`;
   if (group === "old" || story.status === "rotated_off") {
-    return `<p class="story-note">This story was moved off the playlist to make room for newer stories.</p>`;
+    return `<p class="story-note">${escapeHtml(getStoryCapacityNote(story) || "This story was moved off the playlist to make room for newer stories.")}</p>`;
   }
   if (story.status === "skipped") return `<p class="story-note">This story is skipped for now.</p>`;
   if (group === "on_yoto" && story.status === "selected") {
@@ -1526,7 +1866,7 @@ const renderStoryDownloadAction = (story, group) => {
   const isManualMode = getEditorStoryRules().newStoryBehavior === "choose_first";
   const isDownloading = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
   const isUploading = storyDownloadState.uploadIds.has(story.id) || story.status === "uploading";
-  const canPrepare = group === "on_yoto" || story.isSelected || story.status === "selected";
+  const canPrepare = group === "on_yoto";
 
   if (isStoryMissingRssAudio(story)) {
     return `<button class="quiet-action" type="button" data-story-details>${story.showDetails ? "Hide details" : "See more"}</button>`;
@@ -2565,6 +2905,13 @@ const saveActiveCard = async () => {
     nextCheck: "",
     newStoryBehavior: storyRules.newStoryBehavior,
     playlistLimit: storyRules.playlistLimit,
+    capacityMode: storyRules.capacityMode,
+    manualMaxStoriesEnabled: storyRules.manualMaxStoriesEnabled,
+    manualMaxStories: storyRules.manualMaxStories,
+    manualMaxStorageEnabled: storyRules.manualMaxStorageEnabled,
+    manualMaxStorageMb: storyRules.manualMaxStorageMb,
+    manualMaxPlayTimeEnabled: storyRules.manualMaxPlayTimeEnabled,
+    manualMaxPlayTimeMinutes: storyRules.manualMaxPlayTimeMinutes,
     favoritesNeverRotate: storyRules.favoritesNeverRotate,
   };
 
@@ -3209,6 +3556,42 @@ newStoryBehaviorButtons.forEach((button) => {
     });
     renderStoryQueue();
     if (button.dataset.newStoryBehavior === "auto_pick") {
+      maybeProcessStoriesForStoryCard(activeCardId);
+    }
+  });
+});
+
+capacityModeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    capacityModeButtons.forEach((option) => {
+      option.classList.toggle("is-selected", option === button);
+    });
+    if (manualCapacityControls) manualCapacityControls.hidden = button.dataset.capacityMode !== "manual";
+    renderStoryQueue();
+    if (getEditorStoryRules().newStoryBehavior === "auto_pick") {
+      maybeProcessStoriesForStoryCard(activeCardId);
+    }
+  });
+});
+
+[
+  manualMaxStoriesEnabled,
+  manualMaxStories,
+  manualMaxStorageEnabled,
+  manualMaxStorageMb,
+  manualMaxPlayTimeEnabled,
+  manualMaxPlayTimeHours,
+  manualMaxPlayTimeMinutes,
+].forEach((control) => {
+  control?.addEventListener("input", () => {
+    renderStoryQueue();
+    if (getEditorStoryRules().newStoryBehavior === "auto_pick") {
+      maybeProcessStoriesForStoryCard(activeCardId);
+    }
+  });
+  control?.addEventListener("change", () => {
+    renderStoryQueue();
+    if (getEditorStoryRules().newStoryBehavior === "auto_pick") {
       maybeProcessStoriesForStoryCard(activeCardId);
     }
   });
