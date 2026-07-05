@@ -30,6 +30,11 @@ let storyDownloadState = {
 let storyProcessRetryTimers = new Map();
 let activityLogEntries = [];
 let activeView = "story-cards";
+let storyQueuePollTimer = null;
+let storyQueuePollInFlight = false;
+let storyQueuePollSignature = "";
+let storyQueuePollUnchangedCount = 0;
+const storyTrackerPreviousSteps = new Map();
 
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
 const MISSING_AUDIO_DOWNLOAD_MESSAGE =
@@ -38,6 +43,10 @@ const MISSING_AUDIO_PARENT_MESSAGE = "This story does not have an audio file Fee
 const MISSING_AUDIO_TECHNICAL_MESSAGE =
   "The RSS feed item did not include a usable http or https audio URL.";
 const MIN_PLAYLIST_RETRY_DELAY_MS = 5_000;
+const STORY_QUEUE_FAST_POLL_MS = 3_000;
+const STORY_QUEUE_WAITING_POLL_MS = 5_000;
+const STORY_QUEUE_SLOW_POLL_MS = 15_000;
+const STORY_QUEUE_SLOW_AFTER_UNCHANGED_POLLS = 24;
 
 const storyStatusLabels = {
   discovered: "New story found",
@@ -61,6 +70,7 @@ const storyTrackerSteps = [
   { key: "updating", label: "Updating Playlist" },
   { key: "ready", label: "Ready" },
 ];
+const STORY_TRACKER_STEP_SPACING = 46;
 
 const defaultStoryRules = {
   newStoryBehavior: "auto_pick",
@@ -1008,6 +1018,7 @@ const isStoryReadyToBringHome = (story) =>
 const setStoryDownloadState = (nextState) => {
   storyDownloadState = { ...storyDownloadState, ...nextState };
   renderStoryQueue();
+  updateStoryQueuePolling();
 };
 
 const getStoryStatusClass = (story, group = "new") => {
@@ -1042,7 +1053,15 @@ const getStoryTrackerStep = (story, group = "new") => {
   if (storyNeedsHelp(story)) return getFailedStoryTrackerStep(story);
   if (story?.status === "synced") return "ready";
   if (story?.status === "adding_to_playlist" || shouldRetryStoryPlaylistUpdate(story)) return "updating";
-  if (isStoryWaitingForYoto(story) || story?.status === "uploading" || story?.status === "uploaded") return "sending";
+  if (
+    isStoryWaitingForYoto(story) ||
+    ["uploading", "processing", "uploaded", "waiting_on_yoto"].includes(story?.status) ||
+    story?.yotoUploadStatus === "processing" ||
+    story?.yotoTranscodeStatus === "processing" ||
+    story?.playlistUpdateStatus === "waiting"
+  ) {
+    return "sending";
+  }
   if (story?.status === "downloading" || story?.status === "downloaded") return "preparing";
   if (group === "on_yoto" || story?.status === "selected") return "found";
   return "found";
@@ -1060,27 +1079,79 @@ const isStoryActivelyProcessing = (story) =>
 const shouldShowStoryTracker = (story, group = "new") => {
   if (isStoryMissingRssAudio(story)) return false;
   if (group === "old" || story.status === "skipped" || story.status === "rotated_off") return false;
-  if (storyNeedsHelp(story) || story.status === "synced" || story.status === "downloaded") return false;
+  if (story.status === "selected") return true;
+  if (storyNeedsHelp(story) || story.status === "synced" || story.status === "downloaded") return true;
   return isStoryActivelyProcessing(story);
+};
+
+const getStoryTrackerStepIndex = (stepKey) => {
+  const index = storyTrackerSteps.findIndex((step) => step.key === stepKey);
+  return Math.max(0, index);
+};
+
+const getStorySendingWork = (story) => {
+  if (getStoryTrackerStep(story) !== "sending") return null;
+  return { label: "Working" };
 };
 
 const renderStoryTracker = (story, group = "new") => {
   if (!shouldShowStoryTracker(story, group)) return "";
 
   const activeStep = getStoryTrackerStep(story, group);
-  const statusIndex = Math.max(0, storyTrackerSteps.findIndex((step) => step.key === activeStep));
+  const statusIndex = getStoryTrackerStepIndex(activeStep);
+  const previousIndex = storyTrackerPreviousSteps.has(story.id)
+    ? storyTrackerPreviousSteps.get(story.id)
+    : statusIndex;
+  const stepDistance = Math.abs(previousIndex - statusIndex);
+  const startOffset = (previousIndex - statusIndex) * STORY_TRACKER_STEP_SPACING;
+  const moveDuration = Math.min(2600, Math.max(1200, 850 + stepDistance * 520));
+  const readyDuration = Math.min(5200, Math.max(3400, 2600 + stepDistance * 900));
+  const isReady = story.status === "synced";
+  const isFailed = storyNeedsHelp(story);
+  const isMoving = previousIndex !== statusIndex;
+  const justReachedReady = isReady && previousIndex !== statusIndex;
+  const sendingWork = getStorySendingWork(story);
+  const cardStateClass = [
+    isMoving ? "is-moving" : "",
+    sendingWork && !isMoving ? "is-working" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  storyTrackerPreviousSteps.set(story.id, statusIndex);
 
   return `
-    <div class="story-tracker" aria-label="Story Tracker">
-      <p>Story Tracker</p>
-      <ol>
+    <div class="story-tracker story-tracker-animated ${isReady ? "is-ready" : ""} ${justReachedReady ? "is-ready-arriving" : ""} ${isFailed ? "is-failed" : ""}" aria-label="Story Journey" data-active-step="${statusIndex}">
+      <p>Story Journey</p>
+      <ol style="--tracker-book-top: ${statusIndex * STORY_TRACKER_STEP_SPACING}px; --tracker-start-offset: ${startOffset}px; --tracker-move-duration: ${moveDuration}ms; --tracker-ready-duration: ${readyDuration}ms;">
         ${storyTrackerSteps
           .map((step, index) => {
-            const state = index < statusIndex ? "is-done" : index === statusIndex ? "is-active" : "";
-            return `<li class="story-tracker-step ${state}"><span></span>${escapeHtml(step.label)}</li>`;
+            const state =
+              index < statusIndex || (isReady && index < storyTrackerSteps.length - 1)
+                ? "is-done"
+                : index === statusIndex
+                  ? "is-active"
+                  : "";
+            const readyIndicator =
+              step.key === "ready"
+                ? `<span class="story-tracker-ready-badge ${isReady ? "is-complete" : ""}" aria-hidden="true"></span>`
+                : `<span class="story-tracker-step-dot"></span>`;
+            return `<li class="story-tracker-step ${state}">${readyIndicator}${escapeHtml(step.label)}</li>`;
           })
           .join("")}
+        ${
+          isReady
+            ? `<span class="story-tracker-book story-tracker-book-ready ${justReachedReady ? "is-arriving" : ""}" aria-hidden="true"><span></span></span>`
+            : `<span class="story-tracker-book ${cardStateClass}" aria-hidden="true"><span></span></span>`
+        }
       </ol>
+      ${
+        sendingWork
+          ? `<div class="story-tracker-working" aria-label="${escapeAttribute(sendingWork.label)}">
+              <span class="story-tracker-spinner" aria-hidden="true"></span>
+              <span>${escapeHtml(sendingWork.label)}</span>
+            </div>`
+          : ""
+      }
     </div>
   `;
 };
@@ -1381,7 +1452,7 @@ const getStoryControlsForGroup = (story, group) => {
     controls.push({ action: "add_back", label: "Add Back", active: false, style: "outline" });
   }
 
-  if (!isStoryMissingRssAudio(story)) {
+  if (group === "on_yoto" && !isResting && !isSkipped && !isStoryMissingRssAudio(story)) {
     controls.push(
       story.isPinned
         ? { action: "pin", label: "Remove Favorite", active: true }
@@ -1445,6 +1516,9 @@ const getStoryContextMarkup = (story, group) => {
     return `<p class="story-note">This story was moved off the playlist to make room for newer stories.</p>`;
   }
   if (story.status === "skipped") return `<p class="story-note">This story is skipped for now.</p>`;
+  if (group === "on_yoto" && story.status === "selected") {
+    return `<p class="story-note">Feed Your Yoto will get this story ready for Yoto next.</p>`;
+  }
   return "";
 };
 
@@ -1452,6 +1526,7 @@ const renderStoryDownloadAction = (story, group) => {
   const isManualMode = getEditorStoryRules().newStoryBehavior === "choose_first";
   const isDownloading = storyDownloadState.storyIds.has(story.id) || story.status === "downloading";
   const isUploading = storyDownloadState.uploadIds.has(story.id) || story.status === "uploading";
+  const canPrepare = group === "on_yoto" || story.isSelected || story.status === "selected";
 
   if (isStoryMissingRssAudio(story)) {
     return `<button class="quiet-action" type="button" data-story-details>${story.showDetails ? "Hide details" : "See more"}</button>`;
@@ -1473,13 +1548,10 @@ const renderStoryDownloadAction = (story, group) => {
     return `${retryButton}${detailsButton}`;
   }
 
-  if (!isManualMode) return "";
-
   if (isStoryReadyToUpload(story)) {
     return `<button class="outline-action" type="button" data-upload-story ${isUploading ? "disabled" : ""}>${isUploading ? "Sending story..." : "Send to Yoto"}</button>`;
   }
 
-  const canPrepare = group === "on_yoto" || story.isSelected || story.status === "selected";
   if (!canPrepare) return "";
 
   if (!isStoryAudioUsable(story)) {
@@ -1487,6 +1559,11 @@ const renderStoryDownloadAction = (story, group) => {
   }
 
   if (!isStoryReadyToBringHome(story)) return "";
+
+  if (!isManualMode) {
+    const busy = storyDownloadState.processing || storyDownloadState.bulk || isDownloading;
+    return `<button class="outline-action" type="button" data-download-story ${busy ? "disabled" : ""}>${busy ? "Getting story ready..." : "Get ready now"}</button>`;
+  }
 
   return `<button class="outline-action" type="button" data-download-story ${isDownloading ? "disabled" : ""}>${isDownloading ? "Getting story ready..." : "Prepare Story"}</button>`;
 };
@@ -1600,9 +1677,135 @@ const renderQueuedStory = (story, group = "new") => {
   `;
 };
 
+const getStoryQueueStatusSignature = (stories = []) =>
+  stories
+    .map((story) =>
+      [
+        story.id,
+        story.status,
+        story.downloadStatus,
+        story.yotoUploadStatus,
+        story.yotoTranscodeStatus,
+        story.playlistUpdateStatus,
+        story.yotoTranscodeRetryAfter,
+        story.playlistUpdateRetryAfter,
+        story.cleanedLocalAudioAt,
+        story.updatedAt,
+      ]
+        .map((value) => String(value || ""))
+        .join(":")
+    )
+    .join("|");
+
+const isStoryWaitingForLiveUpdate = (story) =>
+  Boolean(
+    isStoryWaitingForYoto(story) ||
+      ["downloaded", "processing", "uploaded"].includes(story?.status) ||
+      story?.status === "waiting_on_yoto" ||
+      story?.yotoUploadStatus === "processing" ||
+      story?.yotoTranscodeStatus === "processing" ||
+      story?.playlistUpdateStatus === "waiting"
+  );
+
+const isStoryFastLiveUpdateStatus = (story) =>
+  Boolean(
+    ["downloading", "uploading", "adding_to_playlist", "cleaning_local"].includes(story?.status) ||
+      storyDownloadState.storyIds.has(story.id) ||
+      storyDownloadState.uploadIds.has(story.id)
+  );
+
+const getStoryQueuePollingMode = () => {
+  if (!activeCardId || backdrop.hidden || storyQueueState.status !== "loaded") return "";
+  if (
+    storyDownloadState.bulk ||
+    storyDownloadState.processing ||
+    storyDownloadState.syncing ||
+    storyDownloadState.storyIds.size ||
+    storyDownloadState.uploadIds.size
+  ) {
+    return "fast";
+  }
+
+  if ((storyQueueState.stories || []).some(isStoryFastLiveUpdateStatus)) return "fast";
+  if ((storyQueueState.stories || []).some(isStoryWaitingForLiveUpdate)) return "waiting";
+  return "";
+};
+
+const stopStoryQueuePolling = () => {
+  if (storyQueuePollTimer) {
+    window.clearTimeout(storyQueuePollTimer);
+    storyQueuePollTimer = null;
+  }
+};
+
+const mergePolledStoryQueue = (incomingStories) => {
+  const localById = new Map((storyQueueState.stories || []).map((story) => [story.id, story]));
+  const pendingUpdates = storyQueueState.pendingUpdates || {};
+
+  return incomingStories.map((story) => {
+    const localStory = localById.get(story.id);
+    const pendingPatch = pendingUpdates[story.id];
+    const mergedStory = pendingPatch ? applyStoryQueuePatch(story, pendingPatch) : story;
+
+    return {
+      ...mergedStory,
+      showDetails: Boolean(localStory?.showDetails),
+      activityLog: localStory?.activityLog,
+    };
+  });
+};
+
+const pollStoryQueueOnce = async () => {
+  if (!activeCardId || storyQueuePollInFlight) return;
+
+  storyQueuePollInFlight = true;
+  try {
+    const stories = await apiRequest(`/api/story-cards/${encodeURIComponent(activeCardId)}/stories`);
+    const nextStories = mergePolledStoryQueue(Array.isArray(stories) ? stories : []);
+    const nextSignature = getStoryQueueStatusSignature(nextStories);
+    const isUnchanged = nextSignature === storyQueuePollSignature;
+    storyQueuePollUnchangedCount = isUnchanged ? storyQueuePollUnchangedCount + 1 : 0;
+    storyQueuePollSignature = nextSignature;
+
+    if (!isUnchanged) {
+      setStoryQueueState({
+        status: "loaded",
+        stories: nextStories,
+        pendingUpdates: storyQueueState.pendingUpdates || {},
+        addBackConfirmId: storyQueueState.addBackConfirmId || "",
+      });
+    }
+  } catch (error) {
+    console.warn("Could not refresh Story Queue status.", error);
+    stopStoryQueuePolling();
+  } finally {
+    storyQueuePollInFlight = false;
+    updateStoryQueuePolling();
+  }
+};
+
+const updateStoryQueuePolling = () => {
+  stopStoryQueuePolling();
+
+  const mode = getStoryQueuePollingMode();
+  if (!mode) {
+    storyQueuePollUnchangedCount = 0;
+    storyQueuePollSignature = getStoryQueueStatusSignature(storyQueueState.stories || []);
+    return;
+  }
+
+  const baseDelay = mode === "fast" ? STORY_QUEUE_FAST_POLL_MS : STORY_QUEUE_WAITING_POLL_MS;
+  const delay =
+    storyQueuePollUnchangedCount >= STORY_QUEUE_SLOW_AFTER_UNCHANGED_POLLS
+      ? STORY_QUEUE_SLOW_POLL_MS
+      : baseDelay;
+  storyQueuePollTimer = window.setTimeout(pollStoryQueueOnce, delay);
+};
+
 const setStoryQueueState = (nextState) => {
   storyQueueState = { ...storyQueueState, ...nextState };
   renderStoryQueue();
+  updateStoryQueuePolling();
 };
 
 const loadStoryQueue = async (storyCardId, { discoverIfEmpty = false } = {}) => {
@@ -1702,12 +1905,26 @@ const addBackQueuedStory = async (storyId) => {
   setStoryQueueState({ status: "loaded", message: "Adding story back..." });
 
   try {
-    await jsonRequest(
+    const result = await jsonRequest(
       `/api/story-cards/${encodeURIComponent(activeCardId)}/stories/${encodeURIComponent(storyId)}`,
       "PUT",
-      { action: "add_back" }
+      { action: "add_back", includeStories: true }
     );
-    await loadStoryQueue(activeCardId);
+
+    const updatedStory = result?.story || result;
+    const nextStories = Array.isArray(result?.stories)
+      ? mergePolledStoryQueue(result.stories)
+      : storyQueueState.stories.map((story) => (story.id === storyId && updatedStory ? updatedStory : story));
+
+    preserveStoryQueueScrollPosition(storyId, () => {
+      setStoryQueueState({
+        status: "loaded",
+        message: "",
+        stories: nextStories,
+        pendingUpdates: {},
+        addBackConfirmId: "",
+      });
+    });
     maybeProcessStoriesForStoryCard(activeCardId);
   } catch (error) {
     setStoryQueueState({
@@ -1789,6 +2006,34 @@ const mergeStoryQueueUpdates = (updatedStories) => {
     status: "loaded",
     message: "",
     stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
+  });
+};
+
+const getStoryQueueScrollContainer = () => document.querySelector(".dialog-form") || storyQueueContent;
+
+const getStoryElement = (storyId) =>
+  Array.from(storyQueueContent?.querySelectorAll("[data-story-id]") || []).find(
+    (element) => element.dataset.storyId === storyId
+  );
+
+const preserveStoryQueueScrollPosition = (storyId, updateCallback) => {
+  const scrollContainer = getStoryQueueScrollContainer();
+  const anchoredStory = getStoryElement(storyId);
+  const previousTop = anchoredStory?.getBoundingClientRect().top ?? null;
+  const previousScrollTop = scrollContainer?.scrollTop ?? 0;
+
+  updateCallback();
+
+  window.requestAnimationFrame(() => {
+    if (!scrollContainer) return;
+
+    const nextAnchoredStory = getStoryElement(storyId);
+    if (nextAnchoredStory && previousTop !== null) {
+      scrollContainer.scrollTop += nextAnchoredStory.getBoundingClientRect().top - previousTop;
+      return;
+    }
+
+    scrollContainer.scrollTop = previousScrollTop;
   });
 };
 
@@ -2271,6 +2516,7 @@ const openEditor = (storyCard) => {
 const closeEditor = () => {
   hideDeleteConfirmation();
   resetEditorSetupLock();
+  stopStoryQueuePolling();
   backdrop.hidden = true;
   setModalLock();
 };

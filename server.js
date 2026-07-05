@@ -1333,7 +1333,16 @@ const updateQueuedStory = async (storyCardId, storyId, body) => {
     });
   }
 
-  return storyQueue.find((story) => story.id === storyId) || nextStory;
+  const updatedStory = storyQueue.find((story) => story.id === storyId) || nextStory;
+
+  if (body.includeStories === true) {
+    return {
+      story: updatedStory,
+      stories: sortQueuedStories(storyQueue.filter((story) => story.storyCardId === storyCardId)),
+    };
+  }
+
+  return updatedStory;
 };
 
 
@@ -1380,6 +1389,15 @@ const fileExists = async (filePath) => {
 const hasExistingStoryDownload = async (story) => {
   if (!story?.localFilePath || !story?.sha256 || !Number(story?.fileSize)) return false;
   return fileExists(story.localFilePath);
+};
+
+const shouldDownloadStoryAudio = (story = {}) => {
+  if (!isHttpUrl(story.audioUrl)) return false;
+  if (hasAddBackYotoMetadata(story)) return false;
+  if (["downloading", "uploading", "uploaded", "adding_to_playlist", "synced", "cleaning_local"].includes(story.status)) {
+    return false;
+  }
+  return ["selected", "discovered", "downloaded", "failed"].includes(story.status);
 };
 
 const isStorySafeForLocalAudioCleanup = (story = {}) =>
@@ -2231,6 +2249,7 @@ const downloadSelectedStories = async (storyCardId) => {
       continue;
     }
     if (await hasExistingStoryDownload(currentStory)) continue;
+    if (!shouldDownloadStoryAudio(currentStory)) continue;
 
     const updatedStory = await downloadStoryAudio(storyCardId, storyId);
     if (updatedStory.status === "failed") {
