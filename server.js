@@ -30,6 +30,8 @@ const YOTO_TRANSCODE_MAX_ATTEMPTS = 12;
 const YOTO_TRANSCODE_POLL_INTERVAL_MS = 5_000;
 const YOTO_PLAYLIST_PROCESSING_RETRY_MS = 2 * 60 * 1000;
 const YOTO_TRANSCODE_MAX_RETRY_WINDOWS = 30;
+const MAX_LOCAL_AUDIO_FILES = 5;
+const MAX_STORY_PIPELINE_CONCURRENCY = 1;
 const AUTOMATIC_SCHEDULER_START_DELAY_MS = 15_000;
 const AUTOMATIC_SCHEDULER_INTERVAL_MS = 15 * 60 * 1000;
 const AUTOMATIC_STORY_CARD_INTERVAL_MS = 60 * 60 * 1000;
@@ -58,6 +60,9 @@ let resolvedDataDir = null;
 let automaticSchedulerTimer = null;
 let automaticSchedulerRunning = false;
 const automaticRunsInProgress = new Set();
+const boundedPipelineRunsInProgress = new Set();
+const localAudioDownloadReservations = new Map();
+let activityLogWriteQueue = Promise.resolve();
 
 const getDataDir = async () => {
   if (resolvedDataDir) return resolvedDataDir;
@@ -106,7 +111,20 @@ const readJsonFile = async (filePath) => {
 };
 
 const writeJsonFile = async (filePath, value) => {
-  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") {
+        console.warn(`Could not remove temporary JSON file ${tempPath}.`, cleanupError);
+      }
+    }
+    throw error;
+  }
 };
 
 const deleteFileIfExists = async (filePath) => {
@@ -176,8 +194,16 @@ const writeStoryQueue = async (storyQueue) => {
 };
 
 const readActivityLog = async () => {
-  const activityLog = await readJsonFile(await getActivityLogPath());
-  return Array.isArray(activityLog) ? activityLog : [];
+  try {
+    const activityLog = await readJsonFile(await getActivityLogPath());
+    return Array.isArray(activityLog) ? activityLog : [];
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      console.error("Activity Log file is not valid JSON. Starting with an empty log.", error);
+      return [];
+    }
+    throw error;
+  }
 };
 
 const writeActivityLog = async (activityLog) => {
@@ -187,22 +213,30 @@ const writeActivityLog = async (activityLog) => {
 const createActivityLogId = () =>
   `activity-${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`;
 
-const addActivityLogEntry = async (entry = {}) => {
-  const activityLog = await readActivityLog();
-  const nextEntry = {
-    id: createActivityLogId(),
-    createdAt: new Date().toISOString(),
-    level: ["info", "warning", "error"].includes(entry.level) ? entry.level : "info",
-    storyCardId: String(entry.storyCardId || "").trim(),
-    storyId: String(entry.storyId || "").trim(),
-    eventType: String(entry.eventType || "system").trim(),
-    title: String(entry.title || "Feed Your Yoto update").trim(),
-    message: String(entry.message || "").trim(),
-    details: entry.details && typeof entry.details === "object" ? entry.details : {},
-  };
+const runActivityLogWrite = (operation) => {
+  const nextWrite = activityLogWriteQueue.then(operation, operation);
+  activityLogWriteQueue = nextWrite.catch(() => {});
+  return nextWrite;
+};
 
-  await writeActivityLog([nextEntry, ...activityLog].slice(0, 500));
-  return nextEntry;
+const addActivityLogEntry = async (entry = {}) => {
+  return runActivityLogWrite(async () => {
+    const activityLog = await readActivityLog();
+    const nextEntry = {
+      id: createActivityLogId(),
+      createdAt: new Date().toISOString(),
+      level: ["info", "warning", "error"].includes(entry.level) ? entry.level : "info",
+      storyCardId: String(entry.storyCardId || "").trim(),
+      storyId: String(entry.storyId || "").trim(),
+      eventType: String(entry.eventType || "system").trim(),
+      title: String(entry.title || "Feed Your Yoto update").trim(),
+      message: String(entry.message || "").trim(),
+      details: entry.details && typeof entry.details === "object" ? entry.details : {},
+    };
+
+    await writeActivityLog([nextEntry, ...activityLog].slice(0, 500));
+    return nextEntry;
+  });
 };
 
 const getActivityLog = async ({ storyCardId = "", storyId = "", level = "", limit = 100 } = {}) => {
@@ -1151,6 +1185,12 @@ const getCapacityLimitMessage = (reason, limits = {}) => {
   return "Max Yoto setting reached.";
 };
 
+const shouldAutoRestoreRestingStory = (story = {}, rules = {}) =>
+  story.status === "rotated_off" &&
+  rules.newStoryBehavior === "auto_pick" &&
+  !(story.isSkipped || story.status === "skipped") &&
+  canStoryOccupyPlaylistSlot(story);
+
 const getSafeCapacityDetails = (storyCard = {}, capacity = getEmptyPlaylistCapacity(), limits = {}) => ({
   capacityMode: limits.capacityMode || storyCard.capacityMode || "yoto_max",
   trackCount: Number(capacity.tracks || 0),
@@ -1174,8 +1214,12 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
     const isSkipped = story.isSkipped || story.status === "skipped";
     const isSelected = story.isSelected || story.status === "selected" || story.status === "synced";
     const isDiscovered = story.status === "discovered";
+    const isRestingAutoCandidate = shouldAutoRestoreRestingStory(story, rules);
     const favoriteIncluded = Boolean(story.isPinned && rules.favoritesNeverRotate);
-    const wantsPlaylistSlot = favoriteIncluded || isSelected || (rules.newStoryBehavior === "auto_pick" && isDiscovered);
+    const wantsPlaylistSlot = favoriteIncluded ||
+      isSelected ||
+      isRestingAutoCandidate ||
+      (rules.newStoryBehavior === "auto_pick" && isDiscovered);
 
     if (isStoryMissingRssAudio(story)) {
       skippedStories.push(story);
@@ -1207,9 +1251,11 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
 
   const prioritizedCandidates = onYotoCandidates.slice().sort((first, second) => {
     if (first.isPinned !== second.isPinned) return first.isPinned ? -1 : 1;
-    const firstSelected = Boolean(first.isSelected || first.status === "selected");
-    const secondSelected = Boolean(second.isSelected || second.status === "selected");
-    if (firstSelected !== secondSelected) return firstSelected ? -1 : 1;
+    if (rules.newStoryBehavior === "choose_first") {
+      const firstSelected = Boolean(first.isSelected || first.status === "selected");
+      const secondSelected = Boolean(second.isSelected || second.status === "selected");
+      if (firstSelected !== secondSelected) return firstSelected ? -1 : 1;
+    }
     const firstDate = first.publishedAt || first.firstSeenAt || "";
     const secondDate = second.publishedAt || second.firstSeenAt || "";
     return new Date(secondDate).getTime() - new Date(firstDate).getTime();
@@ -1622,7 +1668,7 @@ const shouldDownloadStoryAudio = (story = {}) => {
   if (["downloading", "uploading", "uploaded", "adding_to_playlist", "synced", "cleaning_local"].includes(story.status)) {
     return false;
   }
-  return ["selected", "discovered", "downloaded", "failed"].includes(story.status);
+  return ["selected", "discovered", "downloaded", "failed", "rotated_off"].includes(story.status);
 };
 
 const isStorySafeForLocalAudioCleanup = (story = {}) =>
@@ -1652,7 +1698,168 @@ const getSafeCleanupDetails = (story = {}, extras = {}) => ({
   storyId: String(story.id || extras.storyId || "").trim(),
   fileSize: Number(story.fileSize || extras.fileSize || 0),
   cleanedLocalAudioAt: String(extras.cleanedLocalAudioAt || story.cleanedLocalAudioAt || "").trim(),
+  localAudioFileCount: Number(extras.localAudioFileCount || 0),
+  maxLocalAudioFiles: Number(extras.maxLocalAudioFiles || MAX_LOCAL_AUDIO_FILES),
 });
+
+const isStoryExpectedToHaveLocalAudio = (story = {}) =>
+  Boolean(
+    story.localFilePath &&
+      story.downloadStatus !== "cleaned" &&
+      !story.cleanedLocalAudioAt
+  );
+
+const getLocalAudioFileCountForStoryCard = async (storyCardId) => {
+  const stories = (await getStoryQueueForStoryCard(storyCardId)).filter(isStoryExpectedToHaveLocalAudio);
+  return stories.length;
+};
+
+const getLocalAudioReservationCount = (storyCardId) =>
+  Number(localAudioDownloadReservations.get(storyCardId) || 0);
+
+const reserveLocalAudioSlot = (storyCardId) => {
+  localAudioDownloadReservations.set(storyCardId, getLocalAudioReservationCount(storyCardId) + 1);
+};
+
+const releaseLocalAudioSlot = (storyCardId) => {
+  const nextCount = Math.max(getLocalAudioReservationCount(storyCardId) - 1, 0);
+  if (nextCount) {
+    localAudioDownloadReservations.set(storyCardId, nextCount);
+  } else {
+    localAudioDownloadReservations.delete(storyCardId);
+  }
+};
+
+const hasLocalAudioCapacity = async (storyCardId) => {
+  const localAudioFileCount = (await getLocalAudioFileCountForStoryCard(storyCardId)) + getLocalAudioReservationCount(storyCardId);
+  return {
+    hasCapacity: localAudioFileCount < MAX_LOCAL_AUDIO_FILES,
+    localAudioFileCount,
+    maxLocalAudioFiles: MAX_LOCAL_AUDIO_FILES,
+  };
+};
+
+const addLocalAudioCapacityReachedLog = async (storyCardId, details = {}) => {
+  await addActivityLogEntry({
+    level: "info",
+    storyCardId,
+    eventType: "story_pipeline_capacity_reached",
+    title: "Local staging space is full",
+    message: "Local staging space is full, so Feed Your Yoto will upload and clean up before downloading more.",
+    details: {
+      localAudioFileCount: Number(details.localAudioFileCount || 0),
+      maxLocalAudioFiles: Number(details.maxLocalAudioFiles || MAX_LOCAL_AUDIO_FILES),
+    },
+  });
+};
+
+const isStorySafeForUploadedAudioCleanup = (story = {}) =>
+  Boolean(
+    story.localFilePath &&
+      story.downloadStatus === "downloaded" &&
+      !isStoryActivelyProcessingForCleanup(story) &&
+      hasUsableYotoTrackMetadata(story)
+  );
+
+const cleanupUploadedStoryAudio = async (storyCardId, storyId) => {
+  const storyQueue = await readStoryQueue();
+  const story = storyQueue.find((item) => item.storyCardId === storyCardId && item.id === storyId);
+
+  if (!isStorySafeForUploadedAudioCleanup(story)) {
+    return {
+      cleaned: false,
+      skipped: true,
+      reason: "Local audio cleanup waits until Yoto returns usable track metadata.",
+      story: story || null,
+    };
+  }
+
+  const downloadsDir = await getDownloadsDir();
+  if (!isPathInsideDirectory(story.localFilePath, downloadsDir)) {
+    const message = "Feed Your Yoto could not clean up this local audio file.";
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_cleanup_failed",
+      title: "Clean up needs help",
+      message,
+      details: getSafeCleanupDetails(story),
+    });
+    return {
+      cleaned: false,
+      skipped: false,
+      reason: "Local audio file was outside the downloads folder.",
+      story,
+    };
+  }
+
+  try {
+    await deleteFileIfExists(story.localFilePath);
+    const cleanedLocalAudioAt = new Date().toISOString();
+    const cleanedStory = await updateQueuedStoryFields(storyCardId, storyId, {
+      localFilePath: "",
+      localFileName: "",
+      downloadStatus: "cleaned",
+      cleanedLocalAudioAt,
+    });
+
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId,
+      eventType: "story_local_audio_cleaned",
+      title: "Local audio cleaned up",
+      message: "Local audio was cleaned up after Yoto finished processing it.",
+      details: getSafeCleanupDetails(cleanedStory, { cleanedLocalAudioAt }),
+    });
+
+    return { cleaned: true, skipped: false, story: cleanedStory };
+  } catch (error) {
+    const message = "Feed Your Yoto could not clean up this local audio file.";
+    await addActivityLogEntry({
+      level: "error",
+      storyCardId,
+      storyId,
+      eventType: "story_cleanup_failed",
+      title: "Clean up needs help",
+      message,
+      details: getSafeCleanupDetails(story),
+    });
+    return {
+      cleaned: false,
+      skipped: false,
+      reason: error.message || message,
+      story,
+    };
+  }
+};
+
+const cleanupUploadedStoryAudioForStoryCard = async (storyCardId) => {
+  await getStoryCardOrThrow(storyCardId);
+  const cardStories = (await getStoryQueueForStoryCard(storyCardId)).filter(isStorySafeForUploadedAudioCleanup);
+  const cleaned = [];
+  const skipped = [];
+  const failed = [];
+
+  for (const story of cardStories) {
+    const result = await cleanupUploadedStoryAudio(storyCardId, story.id);
+    if (result.cleaned) {
+      cleaned.push(result.story);
+    } else if (result.skipped) {
+      skipped.push({ storyId: story.id, reason: result.reason });
+    } else {
+      failed.push({ storyId: story.id, reason: result.reason });
+    }
+  }
+
+  return {
+    cleaned,
+    skipped,
+    failed,
+    stories: await getStoryQueueForStoryCard(storyCardId),
+  };
+};
 
 const cleanupSyncedStoryAudio = async (storyCardId, storyId) => {
   const storyQueue = await readStoryQueue();
@@ -1837,6 +2044,124 @@ const getAutomaticResultMessage = (result) => {
   return "Automatic check finished.";
 };
 
+const runBoundedStoryPipelineForStoryCard = async (storyCardId, options = {}) => {
+  if (boundedPipelineRunsInProgress.has(storyCardId)) {
+    return {
+      result: "skipped",
+      message: "Story processing is already running for this Story Card.",
+      stories: await getStoryQueueForStoryCard(storyCardId).catch(() => []),
+    };
+  }
+
+  boundedPipelineRunsInProgress.add(storyCardId);
+
+  try {
+    await getStoryCardOrThrow(storyCardId);
+    const startedCapacity = await hasLocalAudioCapacity(storyCardId);
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      eventType: "story_pipeline_bounded_pass_started",
+      title: "Processing stories safely",
+      message: "Feed Your Yoto is processing stories without downloading too many at once.",
+      details: {
+        localAudioFileCount: startedCapacity.localAudioFileCount,
+        maxLocalAudioFiles: startedCapacity.maxLocalAudioFiles,
+      },
+    });
+
+    const summary = {
+      downloadedCount: 0,
+      uploadedCount: 0,
+      waitingCount: 0,
+      syncedCount: 0,
+      cleanedCount: 0,
+      failedCount: 0,
+    };
+
+    const addPipelineResultCounts = (result = {}) => {
+      addCount(summary, "downloadedCount", result.downloaded?.length);
+      addCount(summary, "uploadedCount", result.uploaded?.length);
+      addCount(summary, "waitingCount", result.waiting?.length);
+      addCount(summary, "syncedCount", result.synced?.length);
+      addCount(summary, "cleanedCount", result.cleaned?.length);
+      addCount(summary, "failedCount", result.failed?.length);
+    };
+
+    const cleanupBefore = await cleanupUploadedStoryAudioForStoryCard(storyCardId);
+    addPipelineResultCounts(cleanupBefore);
+
+    const syncedCleanupBefore = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+    addPipelineResultCounts(syncedCleanupBefore);
+
+    const uploadExisting = await uploadReadyStoriesToYoto(storyCardId);
+    addPipelineResultCounts(uploadExisting);
+
+    const syncExisting = await updateYotoStoryPlaylistForStoryCard(storyCardId);
+    addPipelineResultCounts(syncExisting);
+
+    const cleanupAfterExisting = await cleanupUploadedStoryAudioForStoryCard(storyCardId);
+    addPipelineResultCounts(cleanupAfterExisting);
+
+    const localAudioCapacity = await hasLocalAudioCapacity(storyCardId);
+    let downloadResult = {
+      downloaded: [],
+      failed: [],
+      capacityReached: !localAudioCapacity.hasCapacity,
+      stories: await getStoryQueueForStoryCard(storyCardId),
+    };
+
+    if (localAudioCapacity.hasCapacity) {
+      downloadResult = await downloadSelectedStories(storyCardId);
+      addPipelineResultCounts(downloadResult);
+    } else {
+      await addLocalAudioCapacityReachedLog(storyCardId, localAudioCapacity);
+    }
+
+    let uploadNew = { uploaded: [], waiting: [], failed: [], stories: downloadResult.stories };
+    let syncNew = { synced: [], waiting: [], failed: [], stories: downloadResult.stories };
+
+    if (downloadResult.downloaded?.length) {
+      uploadNew = await uploadReadyStoriesToYoto(storyCardId);
+      addPipelineResultCounts(uploadNew);
+      syncNew = await updateYotoStoryPlaylistForStoryCard(storyCardId);
+      addPipelineResultCounts(syncNew);
+    }
+
+    const cleanupAfter = await cleanupUploadedStoryAudioForStoryCard(storyCardId);
+    addPipelineResultCounts(cleanupAfter);
+    const syncedCleanupAfter = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+    addPipelineResultCounts(syncedCleanupAfter);
+
+    const result = summary.failedCount ? "failed" : summary.waitingCount ? "waiting" : "success";
+    const message = downloadResult.capacityReached
+      ? "Feed Your Yoto is keeping local storage safe. It will upload and clean up stories before downloading more."
+      : "Feed Your Yoto processed stories safely without downloading too many at once.";
+
+    await addActivityLogEntry({
+      level: result === "failed" ? "warning" : "info",
+      storyCardId,
+      eventType: "story_pipeline_bounded_pass_finished",
+      title: "Story processing finished",
+      message: "Feed Your Yoto processed stories safely without downloading too many at once.",
+      details: {
+        ...summary,
+        ...(await hasLocalAudioCapacity(storyCardId)),
+      },
+    });
+
+    return {
+      result,
+      message,
+      ...summary,
+      capacityReached: downloadResult.capacityReached,
+      stories: syncedCleanupAfter.stories || cleanupAfter.stories || syncNew.stories || uploadNew.stories || downloadResult.stories,
+    };
+  } finally {
+    boundedPipelineRunsInProgress.delete(storyCardId);
+  }
+};
+
 const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
   const ignoreSchedule = options.ignoreSchedule === true;
 
@@ -1916,23 +2241,13 @@ const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
         : 0
     );
 
-    const downloadResult = await downloadSelectedStories(storyCardId);
-    addCount(summary, "downloadedCount", downloadResult.downloaded?.length);
-    addCount(summary, "failedCount", downloadResult.failed?.length);
-
-    const uploadResult = await uploadReadyStoriesToYoto(storyCardId);
-    addCount(summary, "uploadedCount", uploadResult.uploaded?.length);
-    addCount(summary, "waitingCount", uploadResult.waiting?.length);
-    addCount(summary, "failedCount", uploadResult.failed?.length);
-
-    const syncResult = await updateYotoStoryPlaylistForStoryCard(storyCardId);
-    addCount(summary, "syncedCount", syncResult.synced?.length);
-    addCount(summary, "waitingCount", syncResult.waiting?.length);
-    addCount(summary, "failedCount", syncResult.failed?.length);
-
-    const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
-    addCount(summary, "cleanedCount", cleanupResult.cleaned?.length);
-    addCount(summary, "failedCount", cleanupResult.failed?.length);
+    const pipelineResult = await runBoundedStoryPipelineForStoryCard(storyCardId);
+    addCount(summary, "downloadedCount", pipelineResult.downloadedCount);
+    addCount(summary, "uploadedCount", pipelineResult.uploadedCount);
+    addCount(summary, "waitingCount", pipelineResult.waitingCount);
+    addCount(summary, "syncedCount", pipelineResult.syncedCount);
+    addCount(summary, "cleanedCount", pipelineResult.cleanedCount);
+    addCount(summary, "failedCount", pipelineResult.failedCount);
 
     const progressCount =
       summary.discoveredCount +
@@ -1976,7 +2291,7 @@ const runAutomaticStoryCardPipeline = async (storyCardId, options = {}) => {
       result,
       message,
       ...summary,
-      stories: cleanupResult.stories || syncResult.stories || uploadResult.stories || downloadResult.stories,
+      stories: pipelineResult.stories,
     };
   } catch (error) {
     const message = error.expose ? error.message : "Automatic check could not finish.";
@@ -2377,26 +2692,33 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
     throw createExposedError("This story is resting until Feed Your Yoto knows it will fit on the Yoto card.");
   }
 
-  const startDetails = getSafePrepareDetails({ step: "Getting story ready" }, story);
-  await addActivityLogEntry({
-    level: "info",
-    storyCardId,
-    storyId,
-    eventType: "story_prepare_started",
-    title: "Getting story ready",
-    message: "Feed Your Yoto is getting this story ready.",
-    details: startDetails,
-  });
-
-  await updateQueuedStoryFields(storyCardId, storyId, {
-    status: "downloading",
-    downloadStatus: "downloading",
-    downloadError: "",
-    audioUrlHost: startDetails.audioUrlHost,
-    lastPrepareErrorStep: "",
-  });
+  const localAudioCapacity = await hasLocalAudioCapacity(storyCardId);
+  if (!localAudioCapacity.hasCapacity) {
+    await addLocalAudioCapacityReachedLog(storyCardId, localAudioCapacity);
+    throw createExposedError("Feed Your Yoto is keeping local storage safe. It will upload and clean up stories before downloading more.");
+  }
+  reserveLocalAudioSlot(storyCardId);
 
   try {
+    const startDetails = getSafePrepareDetails({ step: "Getting story ready" }, story);
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      storyId,
+      eventType: "story_prepare_started",
+      title: "Getting story ready",
+      message: "Feed Your Yoto is getting this story ready.",
+      details: startDetails,
+    });
+
+    await updateQueuedStoryFields(storyCardId, storyId, {
+      status: "downloading",
+      downloadStatus: "downloading",
+      downloadError: "",
+      audioUrlHost: startDetails.audioUrlHost,
+      lastPrepareErrorStep: "",
+    });
+
     const download = await fetchStoryAudioToFile(story.audioUrl, storyCardId, storyId);
     const details = getSafePrepareDetails(download, story);
     await addActivityLogEntry({
@@ -2453,11 +2775,14 @@ const downloadStoryAudio = async (storyCardId, storyId) => {
       lastPrepareErrorStep: details.step,
       lastPreparedAt: new Date().toISOString(),
     });
+  } finally {
+    releaseLocalAudioSlot(storyCardId);
   }
 };
 
 const downloadSelectedStories = async (storyCardId) => {
   const { storyCard } = await getStoryCardOrThrow(storyCardId);
+  await cleanupUploadedStoryAudioForStoryCard(storyCardId);
   const queuedStories = await getStoryQueueForStoryCard(storyCardId);
   const preview = getPlaylistPreviewForStoryCard(storyCard, queuedStories);
   const selectedCapacityOverflow = (preview.oldStoriesResting || []).filter((story) =>
@@ -2481,8 +2806,11 @@ const downloadSelectedStories = async (storyCardId) => {
   const candidateIds = new Set(preview.onYotoSoon.map((story) => story.id));
   const downloaded = [];
   const failed = [];
+  let capacityReached = false;
 
   for (const storyId of candidateIds) {
+    if (downloaded.length >= MAX_STORY_PIPELINE_CONCURRENCY) break;
+
     const currentStory = (await getStoryQueueForStoryCard(storyCardId)).find(
       (story) => story.id === storyId
     );
@@ -2495,6 +2823,13 @@ const downloadSelectedStories = async (storyCardId) => {
     if (await hasExistingStoryDownload(currentStory)) continue;
     if (!shouldDownloadStoryAudio(currentStory)) continue;
 
+    const localAudioCapacity = await hasLocalAudioCapacity(storyCardId);
+    if (!localAudioCapacity.hasCapacity) {
+      capacityReached = true;
+      await addLocalAudioCapacityReachedLog(storyCardId, localAudioCapacity);
+      break;
+    }
+
     const updatedStory = await downloadStoryAudio(storyCardId, storyId);
     if (updatedStory.status === "failed") {
       failed.push(updatedStory);
@@ -2506,6 +2841,10 @@ const downloadSelectedStories = async (storyCardId) => {
   return {
     downloaded,
     failed,
+    capacityReached,
+    message: capacityReached
+      ? "Feed Your Yoto is keeping local storage safe. It will upload and clean up stories before downloading more."
+      : "",
     stories: await getStoryQueueForStoryCard(storyCardId),
   };
 };
@@ -3189,11 +3528,13 @@ const uploadDownloadedStoryToYoto = async (storyCardId, storyId) => {
 
   try {
     const upload = await uploadStoryFileToYoto(story);
-    return markYotoTranscodeReady(storyCardId, storyId, story, {
+    const uploadedStory = await markYotoTranscodeReady(storyCardId, storyId, story, {
       ...upload,
       step: "Sending story to Yoto",
       yotoUploadStatus: "uploaded",
     });
+    const cleanupResult = await cleanupUploadedStoryAudio(storyCardId, storyId);
+    return cleanupResult.cleaned ? cleanupResult.story : uploadedStory;
   } catch (error) {
     const details = getSafeUploadDetails(error, story);
 
@@ -3445,7 +3786,7 @@ const markYotoTranscodeReady = async (storyCardId, storyId, story, upload = {}) 
     details,
   });
 
-  return updateQueuedStoryFields(storyCardId, storyId, {
+  const readyStory = await updateQueuedStoryFields(storyCardId, storyId, {
     status: "uploaded",
     yotoUploadStatus: "uploaded",
     yotoUploadId: upload.yotoUploadId || story.yotoUploadId || "",
@@ -3467,6 +3808,8 @@ const markYotoTranscodeReady = async (storyCardId, storyId, story, upload = {}) 
     playlistUpdateRetryAfter: "",
     playlistUpdateFailureType: "",
   });
+  const cleanupResult = await cleanupUploadedStoryAudio(storyCardId, storyId);
+  return cleanupResult.cleaned ? cleanupResult.story : readyStory;
 };
 
 const markYotoTranscodeFailed = async (storyCardId, storyId, story, message, details = {}) => {
@@ -3843,6 +4186,16 @@ const verifyYotoPlaylistTracks = (card = {}, tracks = []) => {
   };
 };
 
+const doYotoPlaylistTracksMatch = (card = {}, tracks = []) => {
+  const yotoTrackUrls = getYotoPlaylistTracksFromContent(card)
+    .map((track) => String(track.trackUrl || "").trim())
+    .filter(Boolean);
+  const expectedTrackUrls = tracks.map((track) => String(track.trackUrl || "").trim()).filter(Boolean);
+
+  if (yotoTrackUrls.length !== expectedTrackUrls.length) return false;
+  return expectedTrackUrls.every((trackUrl, index) => yotoTrackUrls[index] === trackUrl);
+};
+
 
 const markPlaylistUpdateWaiting = async (storyCardId, stories, storyCard, details = {}) => {
   const waiting = [];
@@ -3924,9 +4277,24 @@ const markPlaylistUpdateFailed = async (storyCardId, stories, storyCard, message
   return failed;
 };
 
+const addPlaylistUpdateFailedLog = async (storyCardId, storyCard, message, details = {}) => {
+  await addActivityLogEntry({
+    level: "error",
+    storyCardId,
+    eventType: "story_playlist_update_failed",
+    title: "Story Playlist needs help",
+    message,
+    details: getSafePlaylistDetails({
+      ...details,
+      playlistUpdateStatus: "failed",
+    }, storyCard),
+  });
+};
+
 const isPlaylistUpdateCandidateStory = (story = {}) => {
   if (!story || story.storyCardId === undefined) return false;
   if (["uploaded", "synced"].includes(story.status)) return true;
+  if (story.status === "rotated_off") return hasPendingYotoTranscode(story) || hasUsableYotoTrackMetadata(story);
   return story.status === "failed" && (hasPendingYotoTranscode(story) || hasUsableYotoTrackMetadata(story));
 };
 
@@ -4053,32 +4421,33 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
   }
 
   const storiesNeedingPlaylistUpdate = trackStories.filter((story) => story.status !== "synced");
-  if (!storiesNeedingPlaylistUpdate.length) {
-    const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
-    return { synced, waiting, failed, stories: cleanupResult.stories };
-  }
-
-  for (const story of storiesNeedingPlaylistUpdate) {
-    await updateQueuedStoryFields(storyCardId, story.id, {
-      status: "adding_to_playlist",
-      playlistUpdateStatus: "adding",
-      playlistUpdateError: "",
-      playlistUpdateRetryAfter: "",
-      playlistUpdateFailureType: "",
-    });
-    await addActivityLogEntry({
-      level: "info",
-      storyCardId,
-      storyId: story.id,
-      eventType: "story_playlist_update_started",
-      title: "Adding to Story Playlist",
-      message: "Feed Your Yoto is updating this Story Playlist.",
-      details: getSafePlaylistDetails({ ...detailsBase, playlistUpdateStatus: "adding" }, storyCard),
-    });
-  }
 
   try {
     const { card, tokens } = await getYotoPlaylistContent(storyCard);
+    if (!storiesNeedingPlaylistUpdate.length && doYotoPlaylistTracksMatch(card, tracks)) {
+      const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
+      return { synced, waiting, failed, stories: cleanupResult.stories };
+    }
+
+    for (const story of storiesNeedingPlaylistUpdate) {
+      await updateQueuedStoryFields(storyCardId, story.id, {
+        status: "adding_to_playlist",
+        playlistUpdateStatus: "adding",
+        playlistUpdateError: "",
+        playlistUpdateRetryAfter: "",
+        playlistUpdateFailureType: "",
+      });
+      await addActivityLogEntry({
+        level: "info",
+        storyCardId,
+        storyId: story.id,
+        eventType: "story_playlist_update_started",
+        title: "Adding to Story Playlist",
+        message: "Feed Your Yoto is updating this Story Playlist.",
+        details: getSafePlaylistDetails({ ...detailsBase, playlistUpdateStatus: "adding" }, storyCard),
+      });
+    }
+
     assertYotoPlaylistTracksWithinCapacity(tracks, storyCard);
     const updatePayload = buildYotoPlaylistUpdatePayload(card, storyCard, tracks);
     const response = await postYotoJsonWithRefresh("/content", tokens, updatePayload);
@@ -4099,15 +4468,20 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
 
     if (verifiedTrackCount !== tracks.length || verifiedTrackCount === 0) {
       const message = "Feed Your Yoto updated the Story Playlist, but Yoto did not show the stories yet.";
-      failed = [
-        ...failed,
-        ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, {
+      const failureDetails = {
           ...finishDetails,
           step: "Adding to Story Playlist",
           failureType: "playlist_payload_error",
           technicalMessage: "Playlist verification did not find every sent track URL after update.",
-        })),
-      ];
+        };
+      if (storiesNeedingPlaylistUpdate.length) {
+        failed = [
+          ...failed,
+          ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, failureDetails)),
+        ];
+      } else {
+        await addPlaylistUpdateFailedLog(storyCardId, storyCard, message, failureDetails);
+      }
       return { synced, waiting, failed, stories: await getStoryQueueForStoryCard(storyCardId) };
     }
 
@@ -4142,13 +4516,21 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
     }, storyCard);
 
     if (details.failureType === "yoto_processing") {
-      waiting.push(...(await markPlaylistUpdateWaiting(storyCardId, storiesNeedingPlaylistUpdate, storyCard, details)));
+      if (storiesNeedingPlaylistUpdate.length) {
+        waiting.push(...(await markPlaylistUpdateWaiting(storyCardId, storiesNeedingPlaylistUpdate, storyCard, details)));
+      } else {
+        await addPlaylistUpdateFailedLog(storyCardId, storyCard, YOTO_PROCESSING_MESSAGE, details);
+      }
     } else {
       const message = error.expose ? error.message : "Feed Your Yoto could not update this Story Playlist right now.";
-      failed = [
-        ...failed,
-        ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, details)),
-      ];
+      if (storiesNeedingPlaylistUpdate.length) {
+        failed = [
+          ...failed,
+          ...(await markPlaylistUpdateFailed(storyCardId, storiesNeedingPlaylistUpdate, storyCard, message, details)),
+        ];
+      } else {
+        await addPlaylistUpdateFailedLog(storyCardId, storyCard, message, details);
+      }
     }
   }
 

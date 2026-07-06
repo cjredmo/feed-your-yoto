@@ -843,6 +843,23 @@ const setSwitch = (isOn) => {
     : "Only check when I press Refresh Stories.";
 };
 
+const getActiveStoryCard = () => storyCards.find((storyCard) => storyCard.id === activeCardId);
+
+const refreshScheduleDraftPreview = () => {
+  const activeCard = getActiveStoryCard();
+  if (!activeCard) return;
+
+  const automaticChecksEnabled = syncSwitch.classList.contains("is-on");
+  updateEditorPreview({
+    ...activeCard,
+    automaticChecksEnabled,
+    updateRhythm: automaticChecksEnabled ? activeCard.updateRhythm || "daily" : "manual",
+    lateCheckRhythm: automaticChecksEnabled ? activeCard.lateCheckRhythm || "hourly" : "",
+    status: automaticChecksEnabled ? "Updating" : "Taking a Break",
+    statusType: automaticChecksEnabled ? "live" : "paused",
+  });
+};
+
 const setEditorTab = (tabName = "stories") => {
   editorTabs.forEach((tab) => {
     const isSelected = tab.dataset.editorTab === tabName;
@@ -915,6 +932,22 @@ const getStoryRules = (storyCard = {}) => ({
   ...getMigratedCapacitySettings(storyCard),
   favoritesNeverRotate: storyCard.favoritesNeverRotate !== false,
 });
+
+const storyRuleChangeKeys = [
+  "newStoryBehavior",
+  "playlistLimit",
+  "capacityMode",
+  "manualMaxStoriesEnabled",
+  "manualMaxStories",
+  "manualMaxStorageEnabled",
+  "manualMaxStorageMb",
+  "manualMaxPlayTimeEnabled",
+  "manualMaxPlayTimeMinutes",
+  "favoritesNeverRotate",
+];
+
+const haveStoryRulesChanged = (previousRules = {}, nextRules = {}) =>
+  storyRuleChangeKeys.some((key) => previousRules[key] !== nextRules[key]);
 
 const getEditorStoryRules = () => {
   const selectedBehavior = newStoryBehaviorButtons.find((button) =>
@@ -1105,6 +1138,12 @@ const applyPlaylistCapacityLimits = (stories, rules) => {
   return { included, overflow, capacity, limits, warnings: [...new Set(warnings)] };
 };
 
+const shouldAutoRestoreRestingStory = (story = {}, rules = {}) =>
+  story.status === "rotated_off" &&
+  rules.newStoryBehavior === "auto_pick" &&
+  !(story.isSkipped || story.status === "skipped") &&
+  canStoryOccupyPlaylistSlot(story);
+
 const storyStatusesWithPreparedAudio = new Set([
   "downloaded",
   "uploading",
@@ -1149,8 +1188,12 @@ const getPlaylistPreview = (rules, stories) => {
     const isSkipped = story.isSkipped || story.status === "skipped";
     const isSelected = story.isSelected || story.status === "selected" || story.status === "synced";
     const isDiscovered = story.status === "discovered";
+    const isRestingAutoCandidate = shouldAutoRestoreRestingStory(story, rules);
     const favoriteIncluded = Boolean(story.isPinned && rules.favoritesNeverRotate);
-    const wantsPlaylistSlot = favoriteIncluded || isSelected || (rules.newStoryBehavior === "auto_pick" && isDiscovered);
+    const wantsPlaylistSlot = favoriteIncluded ||
+      isSelected ||
+      isRestingAutoCandidate ||
+      (rules.newStoryBehavior === "auto_pick" && isDiscovered);
 
     if (isStoryMissingRssAudio(story)) {
       skippedStories.push(story);
@@ -1163,7 +1206,7 @@ const getPlaylistPreview = (rules, stories) => {
     }
 
     if (wantsPlaylistSlot && canStoryOccupyPlaylistSlot(story)) {
-      onYotoCandidates.push(story);
+      onYotoCandidates.push(isRestingAutoCandidate ? { ...story, isAutoRestoredFromResting: true } : story);
       return;
     }
 
@@ -1182,9 +1225,11 @@ const getPlaylistPreview = (rules, stories) => {
 
   const prioritizedCandidates = onYotoCandidates.slice().sort((first, second) => {
     if (first.isPinned !== second.isPinned) return first.isPinned ? -1 : 1;
-    const firstSelected = Boolean(first.isSelected || first.status === "selected");
-    const secondSelected = Boolean(second.isSelected || second.status === "selected");
-    if (firstSelected !== secondSelected) return firstSelected ? -1 : 1;
+    if (rules.newStoryBehavior === "choose_first") {
+      const firstSelected = Boolean(first.isSelected || first.status === "selected");
+      const secondSelected = Boolean(second.isSelected || second.status === "selected");
+      if (firstSelected !== secondSelected) return firstSelected ? -1 : 1;
+    }
     return getStorySortValue(second) - getStorySortValue(first);
   });
 
@@ -1234,6 +1279,9 @@ const renderStoryQueuePodcastSummary = () => {
 
 const isStoryReadyToBringHome = (story) =>
   isStoryAudioUsable(story) &&
+  !story?.yotoUploadId &&
+  !story?.yotoTrackUrl &&
+  !story?.transcodedSha256 &&
   story.status !== "downloaded" &&
   story.status !== "uploading" &&
   story.status !== "uploaded" &&
@@ -1246,10 +1294,13 @@ const setStoryDownloadState = (nextState) => {
   updateStoryQueuePolling();
 };
 
+const isStoryRestingForDisplay = (story, group = "new") =>
+  group === "old" || (story.status === "rotated_off" && !story.isAutoRestoredFromResting);
+
 const getStoryStatusClass = (story, group = "new") => {
   if (storyNeedsHelp(story)) return "is-error";
   if (isStoryMissingRssAudio(story) || story.status === "skipped") return "is-skipped";
-  if (group === "old" || story.status === "rotated_off") return "is-resting";
+  if (isStoryRestingForDisplay(story, group)) return "is-resting";
   if (isStoryWaitingForYoto(story)) return "is-waiting";
   if (["downloading", "downloaded", "uploading", "uploaded", "adding_to_playlist", "selected", "discovered"].includes(story?.status)) {
     return "is-active";
@@ -1260,9 +1311,10 @@ const getStoryStatusClass = (story, group = "new") => {
 
 const getStoryDisplayStatus = (story, group = "new") => {
   if (isStoryMissingRssAudio(story) || story.status === "skipped") return "Skipped";
-  if (group === "old" || story.status === "rotated_off") return "Resting story";
+  if (isStoryRestingForDisplay(story, group)) return "Resting story";
   if (isStoryWaitingForYoto(story)) return "Waiting on Yoto";
   if (storyNeedsHelp(story)) return "Needs help";
+  if (story.isAutoRestoredFromResting && group === "on_yoto") return "Picked for Yoto";
   if (group === "on_yoto" && story.status === "discovered") return "Picked for Yoto";
   if (story.status === "downloading") return "Getting story ready";
   return storyStatusLabels[story.status] || story.statusLabel || "New story found";
@@ -1303,7 +1355,7 @@ const isStoryActivelyProcessing = (story) =>
 
 const shouldShowStoryTracker = (story, group = "new") => {
   if (isStoryMissingRssAudio(story)) return false;
-  if (group === "old" || story.status === "skipped" || story.status === "rotated_off") return false;
+  if (isStoryRestingForDisplay(story, group) || story.status === "skipped") return false;
   if (story.status === "selected") return true;
   if (storyNeedsHelp(story) || story.status === "synced" || story.status === "downloaded") return true;
   return isStoryActivelyProcessing(story);
@@ -1432,7 +1484,7 @@ const getPlaylistRetryDelayMs = (story) => {
 };
 
 const isStoryReadyToSync = (story) =>
-  story?.status === "uploaded" &&
+  (story?.status === "uploaded" || story?.isAutoRestoredFromResting) &&
   hasUsableYotoTrackMetadata(story) &&
   isPlaylistRetryReady(story);
 
@@ -1462,6 +1514,85 @@ const getStoriesReadyToSync = (stories) => (stories || []).filter(isStoryReadyTo
 
 const getStoriesWaitingForYoto = (stories) =>
   (stories || []).filter((story) => isStoryWaitingForPlaylist(story));
+
+const getStoryProcessingProgress = (preview, stories = []) => {
+  const targets = preview.onYotoSoon || [];
+  const targetIds = new Set(targets.map((story) => story.id));
+  const targetStories = stories.filter((story) => targetIds.has(story.id));
+  const totalTargetStories = targets.length;
+  const downloadingStories = targetStories.filter((story) => story.status === "downloading");
+  const sendingStories = targetStories.filter((story) => story.status === "uploading");
+  const waitingStories = targetStories.filter(isStoryWaitingForYoto);
+  const updatingStories = targetStories.filter((story) => story.status === "adding_to_playlist");
+  const readyStories = targetStories.filter((story) => story.status === "synced" || hasUsableYotoTrackMetadata(story));
+  const failedStories = targetStories.filter(storyNeedsHelp);
+  const processedStories = targetStories.filter((story) =>
+    story.status === "synced" ||
+      hasUsableYotoTrackMetadata(story) ||
+      storyNeedsHelp(story) ||
+      isStoryMissingRssAudio(story)
+  );
+  const activeStory = [...downloadingStories, ...sendingStories, ...updatingStories, ...waitingStories][0] || null;
+  const activeCount = downloadingStories.length + sendingStories.length + updatingStories.length;
+  const isWorking =
+    storyDownloadState.processing ||
+    storyDownloadState.bulk ||
+    storyDownloadState.syncing ||
+    storyDownloadState.storyIds.size ||
+    storyDownloadState.uploadIds.size ||
+    activeCount > 0 ||
+    waitingStories.length > 0;
+
+  return {
+    totalTargetStories,
+    processedCount: Math.min(processedStories.length, totalTargetStories),
+    downloadingCount: downloadingStories.length,
+    sendingCount: sendingStories.length,
+    waitingCount: waitingStories.length,
+    updatingCount: updatingStories.length,
+    readyCount: readyStories.length,
+    failedCount: failedStories.length,
+    activeStory,
+    isWorking,
+  };
+};
+
+const renderProcessingProgress = (preview) => {
+  const progress = getStoryProcessingProgress(preview, storyQueueState.stories);
+  if (!progress.isWorking && !progress.waitingCount) return "";
+
+  const percent = progress.totalTargetStories
+    ? Math.min(100, Math.round((progress.processedCount / progress.totalTargetStories) * 100))
+    : 0;
+  const countLabel = progress.totalTargetStories
+    ? `${progress.processedCount} / ${progress.totalTargetStories} stories processed`
+    : "Working...";
+
+  return `
+    <section class="story-processing-progress" aria-label="Processing stories">
+      <div class="story-processing-header">
+        <div>
+          <p class="section-kicker">Processing stories</p>
+          <h4>Processing stories</h4>
+          <span>Feed Your Yoto is downloading, sending, and updating stories. You can leave this page open to watch progress.</span>
+        </div>
+        <strong>${escapeHtml(countLabel)}</strong>
+      </div>
+      <div class="story-processing-track" aria-hidden="true">
+        <span style="width: ${percent}%"></span>
+      </div>
+      <div class="story-processing-counts" aria-label="Processing counts">
+        <span>Downloading <strong>${progress.downloadingCount}</strong></span>
+        <span>Sending to Yoto <strong>${progress.sendingCount}</strong></span>
+        <span>Waiting on Yoto <strong>${progress.waitingCount}</strong></span>
+        <span>Updating playlist <strong>${progress.updatingCount}</strong></span>
+        <span>Ready <strong>${progress.readyCount}</strong></span>
+        <span>Needs help <strong>${progress.failedCount}</strong></span>
+      </div>
+      ${progress.activeStory ? `<p>Now working on: ${escapeHtml(progress.activeStory.title || "Untitled story")}</p>` : ""}
+    </section>
+  `;
+};
 
 const formatDuration = (secondsValue) => {
   const totalSeconds = Number(secondsValue || 0);
@@ -1576,6 +1707,7 @@ const renderStoryStatusSummary = (preview) => {
         <span><strong>${needsHelpCount}</strong> Needs help</span>
       </div>
       ${renderPlaylistCapacityMeter(preview)}
+      ${renderProcessingProgress(preview)}
       ${isAutomaticMode ? `<p class="story-auto-note">${automaticNote}</p>` : renderManualPreparePanel(storiesToPrepare, storiesToSync)}
     </section>
   `;
@@ -1750,7 +1882,7 @@ const canStoryBeAddedBack = (story) =>
 const getStoryControlsForGroup = (story, group) => {
   const controls = [];
   const isManualMode = getEditorStoryRules().newStoryBehavior === "choose_first";
-  const isResting = group === "old" || story.status === "rotated_off";
+  const isResting = isStoryRestingForDisplay(story, group);
   const isSkipped = group === "skipped" || story.status === "skipped";
   const confirmAddBack = storyQueueState.addBackConfirmId === story.id;
 
@@ -1852,7 +1984,7 @@ const getStoryContextMarkup = (story, group) => {
   }
 
   if (isStoryMissingRssAudio(story)) return `<p class="story-note">${escapeHtml(MISSING_AUDIO_PARENT_MESSAGE)}</p>`;
-  if (group === "old" || story.status === "rotated_off") {
+  if (isStoryRestingForDisplay(story, group)) {
     return `<p class="story-note">${escapeHtml(getStoryCapacityNote(story) || "This story was moved off the playlist to make room for newer stories.")}</p>`;
   }
   if (story.status === "skipped") return `<p class="story-note">This story is skipped for now.</p>`;
@@ -2078,13 +2210,13 @@ const stopStoryQueuePolling = () => {
   }
 };
 
-const mergePolledStoryQueue = (incomingStories) => {
+const mergeStoryQueueUiState = (incomingStories, { applyPendingUpdates = true } = {}) => {
   const localById = new Map((storyQueueState.stories || []).map((story) => [story.id, story]));
   const pendingUpdates = storyQueueState.pendingUpdates || {};
 
   return incomingStories.map((story) => {
     const localStory = localById.get(story.id);
-    const pendingPatch = pendingUpdates[story.id];
+    const pendingPatch = applyPendingUpdates ? pendingUpdates[story.id] : null;
     const mergedStory = pendingPatch ? applyStoryQueuePatch(story, pendingPatch) : story;
 
     return {
@@ -2094,6 +2226,8 @@ const mergePolledStoryQueue = (incomingStories) => {
     };
   });
 };
+
+const mergePolledStoryQueue = (incomingStories) => mergeStoryQueueUiState(incomingStories);
 
 const pollStoryQueueOnce = async () => {
   if (!activeCardId || storyQueuePollInFlight) return;
@@ -2162,7 +2296,7 @@ const loadStoryQueue = async (storyCardId, { discoverIfEmpty = false } = {}) => 
 
   try {
     const stories = await apiRequest(`/api/story-cards/${encodeURIComponent(storyCardId)}/stories`);
-    const queueStories = Array.isArray(stories) ? stories : [];
+    const queueStories = mergeStoryQueueUiState(Array.isArray(stories) ? stories : []);
 
     if (discoverIfEmpty && queueStories.length === 0) {
       await discoverStories(storyCardId);
@@ -2194,7 +2328,7 @@ const discoverStories = async (storyCardId = activeCardId) => {
     );
     await refreshStoryCardCache();
     renderCards();
-    const nextStories = Array.isArray(stories) ? stories : [];
+    const nextStories = mergeStoryQueueUiState(Array.isArray(stories) ? stories : []);
     setStoryQueueState({
       status: "loaded",
       stories: nextStories,
@@ -2329,18 +2463,20 @@ const savePendingStoryQueueChanges = async (storyCardId) => {
     )
   );
 
-  const updatedById = new Map(updatedStories.map((story) => [story.id, story]));
-  setStoryQueueState({
-    status: "loaded",
-    message: "",
-    stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
+    const updatedById = new Map(mergeStoryQueueUiState(updatedStories, { applyPendingUpdates: false }).map((story) => [story.id, story]));
+    setStoryQueueState({
+      status: "loaded",
+      message: "",
+      stories: storyQueueState.stories.map((story) => updatedById.get(story.id) || story),
     pendingUpdates: {},
   });
 };
 
 const mergeStoryQueueUpdates = (updatedStories) => {
   const updates = Array.isArray(updatedStories) ? updatedStories : [updatedStories];
-  const updatedById = new Map(updates.filter(Boolean).map((story) => [story.id, story]));
+  const updatedById = new Map(
+    mergeStoryQueueUiState(updates.filter(Boolean), { applyPendingUpdates: false }).map((story) => [story.id, story])
+  );
 
   setStoryQueueState({
     status: "loaded",
@@ -2514,7 +2650,9 @@ const syncStoryPlaylist = async () => {
       `/api/story-cards/${encodeURIComponent(activeCardId)}/sync-playlist`,
       "POST"
     );
-    const nextStories = Array.isArray(result.stories) ? result.stories : storyQueueState.stories;
+    const nextStories = Array.isArray(result.stories)
+      ? mergeStoryQueueUiState(result.stories, { applyPendingUpdates: false })
+      : storyQueueState.stories;
     setStoryQueueState({
       status: "loaded",
       message: result.failed?.length
@@ -2559,8 +2697,8 @@ const processStoriesForStoryCard = async (storyCardId) => {
 
   const preview = getPlaylistPreview(getEditorStoryRules(), storyQueueState.stories);
   const storiesToPrepare = getStoriesNeedingPreparation(preview);
-  const storiesToUpload = getStoriesReadyToUpload(storyQueueState.stories);
-  const storiesToSync = getStoriesReadyToSync(storyQueueState.stories);
+  const storiesToUpload = getStoriesReadyToUpload(preview.onYotoSoon);
+  const storiesToSync = getStoriesReadyToSync(preview.onYotoSoon);
   const storiesToCheckOnYoto = getStoriesWaitingForYoto(storyQueueState.stories).filter(isPlaylistRetryReady);
   if (!storiesToPrepare.length && !storiesToUpload.length && !storiesToSync.length && !storiesToCheckOnYoto.length) {
     scheduleWaitingPlaylistRetry(storyCardId, storyQueueState.stories);
@@ -2578,19 +2716,26 @@ const processStoriesForStoryCard = async (storyCardId) => {
         `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/download-selected`,
         "POST"
       );
-      workingStories = Array.isArray(downloadResult.stories) ? downloadResult.stories : workingStories;
+      workingStories = Array.isArray(downloadResult.stories)
+        ? mergeStoryQueueUiState(downloadResult.stories, { applyPendingUpdates: false })
+        : workingStories;
       if (downloadResult.failed?.length) {
         helpMessage = "Some stories need help before they can get ready.";
+      } else if (downloadResult.capacityReached) {
+        helpMessage = downloadResult.message || "Feed Your Yoto is keeping local storage safe. It will upload and clean up stories before downloading more.";
       }
     }
 
-    const readyAfterDownload = getStoriesReadyToUpload(workingStories);
+    const readyAfterDownloadPreview = getPlaylistPreview(getEditorStoryRules(), workingStories);
+    const readyAfterDownload = getStoriesReadyToUpload(readyAfterDownloadPreview.onYotoSoon);
     if (readyAfterDownload.length) {
       const uploadResult = await jsonRequest(
         `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/upload-ready`,
         "POST"
       );
-      workingStories = Array.isArray(uploadResult.stories) ? uploadResult.stories : workingStories;
+      workingStories = Array.isArray(uploadResult.stories)
+        ? mergeStoryQueueUiState(uploadResult.stories, { applyPendingUpdates: false })
+        : workingStories;
       if (uploadResult.failed?.length) {
         helpMessage = "Some stories need help before they can be sent to Yoto.";
       } else if (uploadResult.waiting?.length) {
@@ -2598,7 +2743,8 @@ const processStoriesForStoryCard = async (storyCardId) => {
       }
     }
 
-    const readyForPlaylist = getStoriesReadyToSync(workingStories);
+    const readyForPlaylistPreview = getPlaylistPreview(getEditorStoryRules(), workingStories);
+    const readyForPlaylist = getStoriesReadyToSync(readyForPlaylistPreview.onYotoSoon);
     const waitingReadyForCheck = getStoriesWaitingForYoto(workingStories).filter(isPlaylistRetryReady);
     if (readyForPlaylist.length || waitingReadyForCheck.length) {
       setStoryDownloadState({ syncing: true });
@@ -2606,7 +2752,9 @@ const processStoriesForStoryCard = async (storyCardId) => {
         `/api/story-cards/${encodeURIComponent(storyCardId)}/sync-playlist`,
         "POST"
       );
-      workingStories = Array.isArray(syncResult.stories) ? syncResult.stories : workingStories;
+      workingStories = Array.isArray(syncResult.stories)
+        ? mergeStoryQueueUiState(syncResult.stories, { applyPendingUpdates: false })
+        : workingStories;
       if (syncResult.failed?.length) {
         helpMessage = "Some stories need help before the Story Playlist is ready.";
       } else if (syncResult.waiting?.length) {
@@ -2621,6 +2769,14 @@ const processStoriesForStoryCard = async (storyCardId) => {
       pendingUpdates: {},
     });
     scheduleWaitingPlaylistRetry(storyCardId, workingStories);
+    const nextPreview = getPlaylistPreview(getEditorStoryRules(), workingStories);
+    const hasMoreImmediateWork =
+      getStoriesNeedingPreparation(nextPreview).length ||
+      getStoriesReadyToUpload(nextPreview.onYotoSoon).length ||
+      getStoriesReadyToSync(nextPreview.onYotoSoon).length;
+    if (hasMoreImmediateWork && !getStoriesWaitingForYoto(workingStories).length) {
+      window.setTimeout(() => processStoriesForStoryCard(storyCardId), 800);
+    }
   } catch (error) {
     setStoryQueueState({
       status: "loaded",
@@ -2683,8 +2839,14 @@ const downloadSelectedStories = async () => {
     );
     setStoryQueueState({
       status: "loaded",
-      message: result.failed?.length ? "Some stories need help before they can get ready." : "",
-      stories: Array.isArray(result.stories) ? result.stories : storyQueueState.stories,
+      message: result.failed?.length
+        ? "Some stories need help before they can get ready."
+        : result.capacityReached
+          ? result.message || "Feed Your Yoto is keeping local storage safe. It will upload and clean up stories before downloading more."
+          : "",
+      stories: Array.isArray(result.stories)
+        ? mergeStoryQueueUiState(result.stories, { applyPendingUpdates: false })
+        : storyQueueState.stories,
       pendingUpdates: {},
     });
   } catch (error) {
@@ -2896,6 +3058,7 @@ const saveActiveCard = async () => {
   const previousText = setButtonBusy(saveCard, true, "Saving...");
 
   const storyRules = getEditorStoryRules();
+  const shouldSyncPlaylistAfterSave = haveStoryRulesChanged(getStoryRules(activeCard), storyRules);
   const updatePayload = {
     automaticChecksEnabled,
     updateRhythm,
@@ -2947,6 +3110,10 @@ const saveActiveCard = async () => {
       populateEditorPlaylistOptions(refreshedCard);
       setStoryRules(refreshedCard);
       renderStoryQueue();
+      if (shouldSyncPlaylistAfterSave) {
+        await syncStoryPlaylist();
+        maybeProcessStoriesForStoryCard(activeCard.id);
+      }
     }
   } catch (error) {
     dialogCrawl.textContent = error.message || "Could not save this Story Card.";
@@ -3665,11 +3832,13 @@ storyQueueContent.addEventListener("click", (event) => {
 syncSwitch.addEventListener("click", () => {
   if (!requireAuth("Connect Yoto to change update settings.")) return;
   setSwitch(!syncSwitch.classList.contains("is-on"));
+  refreshScheduleDraftPreview();
 });
 
 pauseCard.addEventListener("click", () => {
   if (!requireAuth("Connect Yoto to take a break.")) return;
   setSwitch(false);
+  refreshScheduleDraftPreview();
 });
 
 changeSetupDetails.addEventListener("click", () => {
