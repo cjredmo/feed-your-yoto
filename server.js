@@ -1220,16 +1220,29 @@ const getPlaylistCapacityLimits = (storyCard = {}) => {
   };
 };
 
-const getStoryCapacityReason = (story, capacity, limits) => {
+// Some podcast feeds omit enclosure length and episode duration. Those stories need
+// to reach preparation and Yoto processing so we can learn their real metadata.
+// Treating the missing metadata as a hard limit in the interim would otherwise
+// leave them permanently resting and unable to progress.
+const canTemporarilyIncludeUnknownCapacityStory = (story = {}) =>
+  isHttpUrl(story.audioUrl) &&
+  !isStoryMissingRssAudio(story) &&
+  !story.isSkipped &&
+  !["skipped", "rotated_off"].includes(story.status);
+
+const getStoryCapacityReason = (story, capacity, limits, options = {}) => {
   const fileSize = getStoryCapacityFileSize(story);
   const duration = getStoryCapacityDuration(story);
+  const allowUnknownCapacity = Boolean(
+    options.allowUnknownCapacity && canTemporarilyIncludeUnknownCapacityStory(story)
+  );
 
   if (capacity.tracks >= YOTO_MYO_MAX_TRACKS) return "track_limit";
   if (capacity.tracks >= limits.maxTracks) return limits.capacityMode === "manual" ? "manual_story_count" : "track_limit";
   if (fileSize > YOTO_MYO_MAX_TRACK_BYTES) return "track_file_size";
   if (duration > YOTO_MYO_MAX_TRACK_SECONDS) return "track_duration";
-  if (limits.maxStorageBytes && !fileSize) return "unknown_file_size";
-  if (limits.maxPlayTimeSeconds && !duration) return "unknown_duration";
+  if (limits.maxStorageBytes && !fileSize && !allowUnknownCapacity) return "unknown_file_size";
+  if (limits.maxPlayTimeSeconds && !duration && !allowUnknownCapacity) return "unknown_duration";
   if (limits.maxStorageBytes && capacity.fileSize + fileSize > limits.maxStorageBytes) {
     return limits.capacityMode === "manual" ? "manual_storage" : "card_file_size";
   }
@@ -1252,7 +1265,7 @@ const addStoryToPlaylistCapacity = (capacity, story) => {
   };
 };
 
-const applyPlaylistCapacityLimits = (stories = [], rules = {}) => {
+const applyPlaylistCapacityLimits = (stories = [], rules = {}, options = {}) => {
   const limits = getPlaylistCapacityLimits(rules);
   let capacity = getEmptyPlaylistCapacity();
   const included = [];
@@ -1260,7 +1273,7 @@ const applyPlaylistCapacityLimits = (stories = [], rules = {}) => {
   const warnings = [];
 
   stories.forEach((story) => {
-    const capacityReason = getStoryCapacityReason(story, capacity, limits);
+    const capacityReason = getStoryCapacityReason(story, capacity, limits, options);
     if (capacityReason) {
       if (story.isPinned && rules.favoritesNeverRotate && !["track_limit", "track_file_size", "track_duration", "unknown_file_size", "unknown_duration"].includes(capacityReason)) {
         warnings.push("favorites_exceed_limits");
@@ -1364,7 +1377,12 @@ const getPlaylistPreviewForStoryCard = (storyCard, queuedStories) => {
     return new Date(secondDate).getTime() - new Date(firstDate).getTime();
   });
 
-  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules);
+  // Allow valid new podcast audio through to the preparation step when its feed
+  // omitted length/duration metadata. Actual Yoto limits are still enforced from
+  // the downloaded/Yoto-reported metadata before tracks are sent to the playlist.
+  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules, {
+    allowUnknownCapacity: true,
+  });
   const onYotoSoon = capacityPreview.included;
   const oldStoriesResting = [...capacityPreview.overflow, ...oldStoryCandidates];
 

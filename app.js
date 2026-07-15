@@ -1157,16 +1157,28 @@ const getPlaylistCapacityLimits = (rules = {}) => {
   };
 };
 
-const getStoryCapacityReason = (story, capacity, limits) => {
+const canTemporarilyIncludeUnknownCapacityStory = (story = {}) => {
+  const audioUrl = String(story.audioUrl || "").trim().toLowerCase();
+  return (
+    (audioUrl.startsWith("http://") || audioUrl.startsWith("https://")) &&
+    !story.isSkipped &&
+    !["skipped", "rotated_off"].includes(story.status)
+  );
+};
+
+const getStoryCapacityReason = (story, capacity, limits, options = {}) => {
   const fileSize = getStoryCapacityFileSize(story);
   const duration = getStoryCapacityDuration(story);
+  const allowUnknownCapacity = Boolean(
+    options.allowUnknownCapacity && canTemporarilyIncludeUnknownCapacityStory(story)
+  );
 
   if (capacity.tracks >= YOTO_MYO_MAX_TRACKS) return "track_limit";
   if (capacity.tracks >= limits.maxTracks) return limits.capacityMode === "manual" ? "manual_story_count" : "track_limit";
   if (fileSize > YOTO_MYO_MAX_TRACK_BYTES) return "track_file_size";
   if (duration > YOTO_MYO_MAX_TRACK_SECONDS) return "track_duration";
-  if (limits.maxStorageBytes && !fileSize) return "unknown_file_size";
-  if (limits.maxPlayTimeSeconds && !duration) return "unknown_duration";
+  if (limits.maxStorageBytes && !fileSize && !allowUnknownCapacity) return "unknown_file_size";
+  if (limits.maxPlayTimeSeconds && !duration && !allowUnknownCapacity) return "unknown_duration";
   if (limits.maxStorageBytes && capacity.fileSize + fileSize > limits.maxStorageBytes) {
     return limits.capacityMode === "manual" ? "manual_storage" : "card_file_size";
   }
@@ -1189,7 +1201,7 @@ const addStoryToPlaylistCapacity = (capacity, story) => {
   };
 };
 
-const applyPlaylistCapacityLimits = (stories, rules) => {
+const applyPlaylistCapacityLimits = (stories, rules, options = {}) => {
   const limits = getPlaylistCapacityLimits(rules);
   let capacity = getEmptyPlaylistCapacity();
   const included = [];
@@ -1197,7 +1209,7 @@ const applyPlaylistCapacityLimits = (stories, rules) => {
   const warnings = [];
 
   stories.forEach((story) => {
-    const capacityReason = getStoryCapacityReason(story, capacity, limits);
+    const capacityReason = getStoryCapacityReason(story, capacity, limits, options);
     if (capacityReason) {
       if (story.isPinned && rules.favoritesNeverRotate && !["track_limit", "track_file_size", "track_duration", "unknown_file_size", "unknown_duration"].includes(capacityReason)) {
         warnings.push("favorites_exceed_limits");
@@ -1312,7 +1324,9 @@ const getPlaylistPreview = (rules, stories) => {
     return getStorySortValue(second) - getStorySortValue(first);
   });
 
-  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules);
+  const capacityPreview = applyPlaylistCapacityLimits(prioritizedCandidates, rules, {
+    allowUnknownCapacity: true,
+  });
   const onYotoSoon = capacityPreview.included;
   const oldStoriesResting = [...capacityPreview.overflow, ...oldStoryCandidates];
 
