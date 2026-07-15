@@ -2,6 +2,9 @@ const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const dns = require("node:dns").promises;
+const net = require("node:net");
+const sharp = require("sharp");
 
 const PORT = Number(process.env.PORT || 4173);
 const PUBLIC_DIR = __dirname;
@@ -22,6 +25,11 @@ const STATIC_FILES = new Set([
 const PODCAST_FEED_TIMEOUT_MS = 10_000;
 const PODCAST_FEED_MAX_REDIRECTS = 5;
 const PODCAST_FEED_MAX_BYTES = 2_000_000;
+const PODCAST_ARTWORK_TIMEOUT_MS = 15_000;
+const PODCAST_ARTWORK_MAX_REDIRECTS = 5;
+const PODCAST_ARTWORK_MAX_BYTES = 15 * 1024 * 1024;
+const YOTO_COVER_WIDTH = 638;
+const YOTO_COVER_HEIGHT = 1011;
 const STORY_AUDIO_TIMEOUT_MS = 30_000;
 const STORY_AUDIO_MAX_REDIRECTS = 15;
 const STORY_AUDIO_MAX_BYTES = 150 * 1024 * 1024;
@@ -543,8 +551,6 @@ const parsePodcastFeed = (xml) => {
   };
 };
 
-const parsePodcastStories = (xml) => sortPodcastEpisodes(parsePodcastEpisodes(getPodcastChannelXml(xml)));
-
 const fetchPodcastFeedXml = async (podcastLink, redirectCount = 0) => {
   if (redirectCount > PODCAST_FEED_MAX_REDIRECTS) {
     throw createExposedError("That Podcast Link redirected too many times.", 502);
@@ -674,6 +680,54 @@ const normalizeAutomaticChecksEnabled = (body = {}, existingCard = {}) => {
   return rhythm !== "manual";
 };
 
+const playlistImageSources = new Set([
+  "yoto_custom",
+  "rss_on_yoto",
+  "rss_fallback",
+  "placeholder",
+]);
+
+const normalizePlaylistImageSourceValue = (value) => {
+  const source = String(value || "").trim();
+  if (playlistImageSources.has(source)) return source;
+  if (source === "yoto") return "yoto_custom";
+  if (source === "rss") return "rss_fallback";
+  return "";
+};
+
+const normalizePlaylistImageSyncStatus = (value, source) => {
+  const status = String(value || "").trim();
+  if (["synced", "applying", "fallback", "failed"].includes(status)) return status;
+  if (source === "rss_fallback") return "fallback";
+  if (source === "placeholder") return "fallback";
+  return "synced";
+};
+
+const DEFAULT_PLAYLIST_ARTWORK_LAYOUT = Object.freeze({
+  fit: "contain",
+  zoom: 100,
+  positionX: 50,
+  positionY: 50,
+  backgroundColor: "#ffffff",
+});
+
+const normalizePlaylistArtworkLayout = (value = {}) => {
+  const backgroundColor = String(value?.backgroundColor || "").trim().toLowerCase();
+  return {
+    fit: value?.fit === "cover" ? "cover" : "contain",
+    zoom: Math.round(clampNumber(value?.zoom, 100, 200, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.zoom)),
+    positionX: Math.round(clampNumber(value?.positionX, 0, 100, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.positionX)),
+    positionY: Math.round(clampNumber(value?.positionY, 0, 100, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.positionY)),
+    backgroundColor: /^#[0-9a-f]{6}$/.test(backgroundColor)
+      ? backgroundColor
+      : DEFAULT_PLAYLIST_ARTWORK_LAYOUT.backgroundColor,
+  };
+};
+
+const arePlaylistArtworkLayoutsEqual = (first, second) =>
+  JSON.stringify(normalizePlaylistArtworkLayout(first)) ===
+  JSON.stringify(normalizePlaylistArtworkLayout(second));
+
 const getNextAutomaticCheckAt = (storyCard = {}, fromDate = new Date()) => {
   if (!isAutomaticChecksEnabled(storyCard)) return "";
 
@@ -725,6 +779,21 @@ const normalizeStoryCard = (body, existingCard = {}) => {
   const now = new Date().toISOString();
   const automaticChecksEnabled = normalizeAutomaticChecksEnabled(body, existingCard);
   const capacitySettings = getStoryCapacitySettings({ ...existingCard, ...body });
+  const requestedPodcastImageUrl = hasOwn(body, "podcastImageUrl")
+    ? body.podcastImageUrl
+    : existingCard.podcastImageUrl;
+  const requestedYotoPlaylistImageUrl = hasOwn(body, "yotoPlaylistImageUrl")
+    ? body.yotoPlaylistImageUrl
+    : existingCard.yotoPlaylistImageUrl ?? existingCard.yotoCardImageUrl ?? body.yotoCardImageUrl;
+  const podcastImageUrl = isHttpUrl(requestedPodcastImageUrl) ? requestedPodcastImageUrl : null;
+  const yotoPlaylistImageUrl = isHttpUrl(requestedYotoPlaylistImageUrl)
+    ? requestedYotoPlaylistImageUrl
+    : null;
+  const requestedPlaylistImageSource = normalizePlaylistImageSourceValue(
+    body.playlistImageSource ?? existingCard.playlistImageSource
+  );
+  const playlistImageSource = requestedPlaylistImageSource ||
+    (yotoPlaylistImageUrl ? "yoto_custom" : podcastImageUrl ? "rss_fallback" : "placeholder");
   const updateRhythm = String(
     body.updateRhythm || existingCard.updateRhythm || (automaticChecksEnabled ? "daily" : "manual")
   ).trim();
@@ -736,9 +805,7 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     podcastLink: String(body.podcastLink || "").trim(),
     podcastTitle: String(body.podcastTitle ?? existingCard.podcastTitle ?? "").trim(),
     podcastDescription: String(body.podcastDescription ?? existingCard.podcastDescription ?? "").trim(),
-    podcastImageUrl: isHttpUrl(body.podcastImageUrl ?? existingCard.podcastImageUrl)
-      ? body.podcastImageUrl ?? existingCard.podcastImageUrl
-      : null,
+    podcastImageUrl,
     latestEpisodeTitle: String(body.latestEpisodeTitle ?? existingCard.latestEpisodeTitle ?? "").trim(),
     latestEpisodePublishedAt: String(
       body.latestEpisodePublishedAt ?? existingCard.latestEpisodePublishedAt ?? ""
@@ -759,9 +826,37 @@ const normalizeStoryCard = (body, existingCard = {}) => {
     ).trim(),
     yotoPlaylistId: String(body.yotoPlaylistId || "").trim(),
     yotoPlaylistTitle: String(body.yotoPlaylistTitle || "Story Playlist").trim(),
-    yotoPlaylistImageUrl: isHttpUrl(body.yotoPlaylistImageUrl)
-      ? body.yotoPlaylistImageUrl
+    yotoPlaylistImageUrl,
+    playlistImageSource,
+    playlistArtworkLayout: body.playlistArtworkLayout || existingCard.playlistArtworkLayout
+      ? normalizePlaylistArtworkLayout(body.playlistArtworkLayout ?? existingCard.playlistArtworkLayout)
       : null,
+    lastPodcastArtworkLayout: body.lastPodcastArtworkLayout || existingCard.lastPodcastArtworkLayout
+      ? normalizePlaylistArtworkLayout(body.lastPodcastArtworkLayout ?? existingCard.lastPodcastArtworkLayout)
+      : null,
+    lastPodcastImageAppliedUrl: isHttpUrl(
+      body.lastPodcastImageAppliedUrl ?? existingCard.lastPodcastImageAppliedUrl
+    )
+      ? body.lastPodcastImageAppliedUrl ?? existingCard.lastPodcastImageAppliedUrl
+      : "",
+    lastPodcastImageAutoApplyAttemptUrl: isHttpUrl(
+      body.lastPodcastImageAutoApplyAttemptUrl ?? existingCard.lastPodcastImageAutoApplyAttemptUrl
+    )
+      ? body.lastPodcastImageAutoApplyAttemptUrl ?? existingCard.lastPodcastImageAutoApplyAttemptUrl
+      : "",
+    playlistImageLastSyncedAt: toIsoString(
+      body.playlistImageLastSyncedAt ?? existingCard.playlistImageLastSyncedAt
+    ),
+    playlistImageLastAutoApplyAttemptAt: toIsoString(
+      body.playlistImageLastAutoApplyAttemptAt ?? existingCard.playlistImageLastAutoApplyAttemptAt
+    ),
+    playlistImageSyncStatus: normalizePlaylistImageSyncStatus(
+      body.playlistImageSyncStatus ?? existingCard.playlistImageSyncStatus,
+      playlistImageSource
+    ),
+    playlistImageSyncMessage: String(
+      body.playlistImageSyncMessage ?? existingCard.playlistImageSyncMessage ?? ""
+    ).trim(),
     updateRhythm: legacyRhythm,
     lateCheckRhythm: automaticChecksEnabled ? String(body.lateCheckRhythm || existingCard.lateCheckRhythm || "hourly").trim() : "",
     automaticChecksEnabled,
@@ -861,7 +956,8 @@ const createStoryCard = async (body) => {
   });
   storyCards.push(storyCard);
   await writeStoryCards(storyCards);
-  return storyCard;
+  const artworkSync = await syncStoryCardArtworkFromYoto(storyCard.id);
+  return artworkSync.storyCard || storyCard;
 };
 
 const updateStoryCard = async (id, body) => {
@@ -874,6 +970,9 @@ const updateStoryCard = async (id, body) => {
     error.expose = true;
     throw error;
   }
+
+  const playlistChanged =
+    hasOwn(body, "yotoPlaylistId") && body.yotoPlaylistId !== storyCards[index].yotoPlaylistId;
 
   if (didDangerousStoryCardFieldChange(storyCards[index], body)) {
     if (body.setupChangeAcknowledged !== true) {
@@ -912,6 +1011,10 @@ const updateStoryCard = async (id, body) => {
   const nextStoryCard = normalizeStoryCard(merged, storyCards[index]);
   storyCards[index] = nextStoryCard;
   await writeStoryCards(storyCards);
+  if (playlistChanged) {
+    const artworkSync = await syncStoryCardArtworkFromYoto(id);
+    return artworkSync.storyCard || nextStoryCard;
+  }
   return nextStoryCard;
 };
 
@@ -1406,7 +1509,22 @@ const discoverStoriesForStoryCard = async (storyCardId) => {
 
   try {
     const xml = await fetchPodcastFeedXml(validatePodcastLink(storyCard.podcastLink));
-    const stories = parsePodcastStories(xml);
+    const channelXml = getPodcastChannelXml(xml);
+    const stories = sortPodcastEpisodes(parsePodcastEpisodes(channelXml));
+    try {
+      await syncStoryCardPodcastArtwork(storyCardId, getPodcastImageUrl(channelXml));
+      await syncStoryCardArtwork(storyCardId);
+    } catch (artworkError) {
+      console.warn("Could not save refreshed podcast artwork.", artworkError.message);
+      await addActivityLogEntry({
+        level: "warning",
+        storyCardId,
+        eventType: "playlist_artwork_sync_failed",
+        title: "Artwork could not be refreshed",
+        message: "Feed Your Yoto could not refresh the artwork right now.",
+        details: getSafeArtworkDetails(storyCard, false),
+      }).catch(() => {});
+    }
     const queuedStories = await upsertQueuedStories(storyCardId, stories);
     const message = stories.length ? `${stories.length} stories found.` : "No stories found yet.";
     await updateStoryCardDiscovery(
@@ -3060,6 +3178,56 @@ const postYotoJsonWithRefresh = async (pathName, tokens, body) => {
   }
 };
 
+const postYotoCoverImageBuffer = async (imageBuffer, tokens) => {
+  if (typeof fetch !== "function") {
+    throw new Error("This server needs Node 18 or newer for built-in fetch.");
+  }
+
+  const uploadUrl = new URL(`${YOTO_API_BASE_URL}/media/coverImage/user/me/upload`);
+  uploadUrl.searchParams.set("autoconvert", "true");
+  uploadUrl.searchParams.set("coverType", "default");
+
+  const response = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${tokens.access_token}`,
+      "Content-Type": "image/jpeg",
+    },
+    body: imageBuffer,
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const error = new Error("Yoto cover image upload failed.");
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+
+  return data;
+};
+
+const postYotoCoverImageBufferWithRefresh = async (imageBuffer, tokens) => {
+  try {
+    return {
+      data: await postYotoCoverImageBuffer(imageBuffer, tokens),
+      tokens,
+    };
+  } catch (error) {
+    if (error.status !== 401) throw error;
+
+    const refreshed = await refreshTokens(tokens);
+    if (!hasCurrentAccessToken(refreshed)) throw error;
+
+    return {
+      data: await postYotoCoverImageBuffer(imageBuffer, refreshed),
+      tokens: refreshed,
+    };
+  }
+};
+
 const normalizePlaylistFailureType = (value) => {
   const failureType = String(value || "").trim();
   return playlistFailureTypes.has(failureType) ? failureType : "unknown";
@@ -4162,6 +4330,33 @@ const buildYotoPlaylistUpdatePayload = (currentCard, storyCard, tracks) => {
     content,
   };
 
+  // Preserve artwork and other unrelated server metadata from the freshly fetched
+  // playlist while replacing only the content fields Feed Your Yoto manages.
+  ["cover", "imageUrl", "createdAt", "deleted", "updatedAt", "userId"].forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(currentCard, field)) payload[field] = currentCard[field];
+  });
+
+  return payload;
+};
+
+const buildYotoPlaylistArtworkUpdatePayload = (currentCard, storyCard, mediaUrl) => {
+  const metadata = currentCard.metadata && typeof currentCard.metadata === "object"
+    ? { ...currentCard.metadata }
+    : {};
+  metadata.cover = {
+    ...(metadata.cover && typeof metadata.cover === "object" ? metadata.cover : {}),
+    imageL: mediaUrl,
+  };
+
+  const payload = {
+    cardId: currentCard.cardId || storyCard.yotoPlaylistId,
+    title: currentCard.title || storyCard.yotoPlaylistTitle || storyCard.name || "Story Playlist",
+    metadata,
+    content: currentCard.content && typeof currentCard.content === "object"
+      ? { ...currentCard.content }
+      : {},
+  };
+
   ["createdAt", "deleted", "updatedAt", "userId"].forEach((field) => {
     if (Object.prototype.hasOwnProperty.call(currentCard, field)) payload[field] = currentCard[field];
   });
@@ -4424,6 +4619,10 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
 
   try {
     const { card, tokens } = await getYotoPlaylistContent(storyCard);
+    await syncStoryCardArtworkFromYoto(storyCardId, {
+      yotoPlaylist: card,
+      logFailure: false,
+    });
     if (!storiesNeedingPlaylistUpdate.length && doYotoPlaylistTracksMatch(card, tracks)) {
       const cleanupResult = await cleanupSyncedStoryAudioForStoryCard(storyCardId);
       return { synced, waiting, failed, stories: cleanupResult.stories };
@@ -4453,6 +4652,10 @@ const updateYotoStoryPlaylistForStoryCard = async (storyCardId) => {
     const response = await postYotoJsonWithRefresh("/content", tokens, updatePayload);
     const responseShape = getSafeYotoResponseShape(response.data);
     const { card: verifiedCard } = await getYotoPlaylistContent(storyCard);
+    await syncStoryCardArtworkFromYoto(storyCardId, {
+      yotoPlaylist: verifiedCard,
+      logFailure: false,
+    });
     const verification = verifyYotoPlaylistTracks(verifiedCard, tracks);
     const verifiedResponseShape = getSafeYotoResponseShape(verifiedCard);
     const verifiedTrackCount = verification.verifiedTrackCount;
@@ -4610,32 +4813,656 @@ const readCardTitle = (card) =>
 const getCardTitle = (card, fallbackCard = null) =>
   readCardTitle(card) || readCardTitle(fallbackCard) || "Untitled Story Playlist";
 
-const isBrowserImageUrl = (value) => {
-  const url = String(value || "");
-  return url.startsWith("http://") || url.startsWith("https://");
+const getValidArtworkUrl = (value) => {
+  try {
+    const url = new URL(String(value || ""));
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+
+    const sensitiveQueryNames = ["access_token", "authorization", "refresh_token"];
+    if (sensitiveQueryNames.some((name) => url.searchParams.has(name))) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
 };
 
-const getYotoPlaylistImageUrl = (item) => {
-  const imageUrl =
-    item?.metadata?.cover?.imageL ||
-    item?.metadata?.cover?.imageM ||
-    item?.metadata?.cover?.imageS ||
-    item?.content?.cover?.imageL ||
-    item?.content?.cover?.imageM ||
-    item?.content?.cover?.imageS ||
-    item?.cover?.imageL ||
-    item?.cover?.imageM ||
-    item?.cover?.imageS ||
-    item?.imageUrl ||
-    item?.metadata?.imageUrl ||
-    item?.metadata?.media?.imageUrl ||
-  "";
+const getYotoPlaylistArtworkUrl = (item) => {
+  // These are the cover fields returned by the existing /content responses. Do not
+  // fall back to track/media URLs: those can be signed audio URLs rather than artwork.
+  const imageUrls = [
+    item?.metadata?.cover?.imageL,
+    item?.metadata?.cover?.imageM,
+    item?.metadata?.cover?.imageS,
+    item?.content?.cover?.imageL,
+    item?.content?.cover?.imageM,
+    item?.content?.cover?.imageS,
+    item?.cover?.imageL,
+    item?.cover?.imageM,
+    item?.cover?.imageS,
+    item?.imageUrl,
+    item?.metadata?.imageUrl,
+    item?.metadata?.media?.imageUrl,
+  ];
 
-  return isBrowserImageUrl(imageUrl) ? imageUrl : null;
+  return imageUrls.map(getValidArtworkUrl).find(Boolean) || null;
+};
+
+const getArtworkMediaIdentity = (value) => {
+  const artworkUrl = getValidArtworkUrl(value);
+  if (!artworkUrl) return "";
+
+  try {
+    const parts = new URL(artworkUrl).pathname.split("/").filter(Boolean);
+    return decodeURIComponent(parts.at(-1) || "");
+  } catch {
+    return "";
+  }
+};
+
+const isUploadedYotoCoverConfirmed = (artworkUrl, uploadResult = {}) => {
+  const confirmedUrl = getValidArtworkUrl(artworkUrl);
+  const uploadedUrl = getValidArtworkUrl(uploadResult?.coverImage?.mediaUrl);
+  if (!confirmedUrl || !uploadedUrl) return false;
+  if (confirmedUrl === uploadedUrl) return true;
+
+  const mediaId = String(uploadResult?.coverImage?.mediaId || "").trim();
+  const uploadedIdentity = mediaId || getArtworkMediaIdentity(uploadedUrl);
+  return Boolean(uploadedIdentity && getArtworkMediaIdentity(confirmedUrl) === uploadedIdentity);
+};
+
+const isPrivateArtworkIpAddress = (address) => {
+  const normalized = String(address || "").trim().toLowerCase();
+  if (!normalized) return true;
+
+  if (net.isIPv4(normalized)) {
+    const parts = normalized.split(".").map(Number);
+    return parts[0] === 0 ||
+      parts[0] === 10 ||
+      parts[0] === 127 ||
+      (parts[0] === 169 && parts[1] === 254) ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) ||
+      (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) ||
+      parts[0] >= 224;
+  }
+
+  if (net.isIPv6(normalized)) {
+    if (normalized.startsWith("::ffff:")) {
+      return isPrivateArtworkIpAddress(normalized.slice("::ffff:".length));
+    }
+    return normalized === "::" ||
+      normalized === "::1" ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      /^fe[89ab]/.test(normalized);
+  }
+
+  return true;
+};
+
+const assertSafePodcastArtworkUrl = async (value) => {
+  const artworkUrl = getValidArtworkUrl(value);
+  if (!artworkUrl) throw createExposedError("The podcast image link is not valid.");
+
+  const parsed = new URL(artworkUrl);
+  const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
+    throw createExposedError("The podcast image address is not allowed.");
+  }
+
+  const addresses = net.isIP(hostname)
+    ? [{ address: hostname }]
+    : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateArtworkIpAddress(address))) {
+    throw createExposedError("The podcast image address is not allowed.");
+  }
+
+  return artworkUrl;
+};
+
+const fetchPodcastArtworkBuffer = async (value, redirectCount = 0) => {
+  if (redirectCount > PODCAST_ARTWORK_MAX_REDIRECTS) {
+    throw createExposedError("The podcast image redirected too many times.", 502);
+  }
+
+  const artworkUrl = await assertSafePodcastArtworkUrl(value);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PODCAST_ARTWORK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(artworkUrl, {
+      headers: {
+        Accept: "image/*, application/octet-stream;q=0.5",
+        "User-Agent": "FeedYourYoto/0.1 (+https://github.com/cjredmo/feed-your-yoto)",
+      },
+      redirect: "manual",
+      signal: controller.signal,
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw createExposedError("The podcast image redirected without a new link.", 502);
+      return fetchPodcastArtworkBuffer(new URL(location, artworkUrl).toString(), redirectCount + 1);
+    }
+
+    if (!response.ok) throw createExposedError("The podcast image could not be downloaded.", 502);
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > PODCAST_ARTWORK_MAX_BYTES) {
+      throw createExposedError("The podcast image is too large to use.");
+    }
+
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (contentType && !contentType.startsWith("image/") && !contentType.startsWith("application/octet-stream")) {
+      throw createExposedError("The podcast image link did not return an image.");
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw createExposedError("The podcast image could not be downloaded.", 502);
+    const chunks = [];
+    let receivedBytes = 0;
+    while (true) {
+      const { done, value: chunk } = await reader.read();
+      if (done) break;
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > PODCAST_ARTWORK_MAX_BYTES) {
+        await reader.cancel();
+        throw createExposedError("The podcast image is too large to use.");
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks, receivedBytes);
+  } catch (error) {
+    if (error.expose) throw error;
+    if (error.name === "AbortError") {
+      throw createExposedError("The podcast image took too long to download.", 502);
+    }
+    throw createExposedError("The podcast image could not be downloaded.", 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const renderPodcastArtworkForYoto = async (podcastImageUrl, layoutValue) => {
+  const layout = normalizePlaylistArtworkLayout(layoutValue);
+  const input = await fetchPodcastArtworkBuffer(podcastImageUrl);
+  const normalized = await sharp(input, { limitInputPixels: 50_000_000, failOn: "error" })
+    .rotate()
+    .toBuffer({ resolveWithObject: true });
+  const sourceWidth = Number(normalized.info.width || 0);
+  const sourceHeight = Number(normalized.info.height || 0);
+  if (!sourceWidth || !sourceHeight) throw createExposedError("The podcast image could not be resized.");
+
+  const baseScale = layout.fit === "cover"
+    ? Math.max(YOTO_COVER_WIDTH / sourceWidth, YOTO_COVER_HEIGHT / sourceHeight)
+    : Math.min(YOTO_COVER_WIDTH / sourceWidth, YOTO_COVER_HEIGHT / sourceHeight);
+  const scale = baseScale * (layout.zoom / 100);
+  const resizedWidth = Math.max(1, Math.round(sourceWidth * scale));
+  const resizedHeight = Math.max(1, Math.round(sourceHeight * scale));
+  const imageLeft = Math.round((YOTO_COVER_WIDTH - resizedWidth) * (layout.positionX / 100));
+  const imageTop = Math.round((YOTO_COVER_HEIGHT - resizedHeight) * (layout.positionY / 100));
+  const cropLeft = Math.max(0, -imageLeft);
+  const cropTop = Math.max(0, -imageTop);
+  const destinationLeft = Math.max(0, imageLeft);
+  const destinationTop = Math.max(0, imageTop);
+  const visibleWidth = Math.min(resizedWidth - cropLeft, YOTO_COVER_WIDTH - destinationLeft);
+  const visibleHeight = Math.min(resizedHeight - cropTop, YOTO_COVER_HEIGHT - destinationTop);
+  if (visibleWidth < 1 || visibleHeight < 1) {
+    throw createExposedError("The selected artwork position is outside the card preview.");
+  }
+
+  const visibleImage = await sharp(normalized.data)
+    .resize(resizedWidth, resizedHeight, { fit: "fill" })
+    .extract({ left: cropLeft, top: cropTop, width: visibleWidth, height: visibleHeight })
+    .toBuffer();
+
+  const imageBuffer = await sharp({
+    create: {
+      width: YOTO_COVER_WIDTH,
+      height: YOTO_COVER_HEIGHT,
+      channels: 3,
+      background: layout.backgroundColor,
+    },
+  })
+    .composite([{ input: visibleImage, left: destinationLeft, top: destinationTop }])
+    .jpeg({ quality: 90, chromaSubsampling: "4:4:4" })
+    .toBuffer();
+
+  return { imageBuffer, layout };
 };
 
 const getCardImageUrl = (card, fallbackCard = null) =>
-  getYotoPlaylistImageUrl(card) || getYotoPlaylistImageUrl(fallbackCard);
+  getYotoPlaylistArtworkUrl(card) || getYotoPlaylistArtworkUrl(fallbackCard);
+
+const getResolvedStoryCardArtwork = (storyCard = {}) => {
+  const yotoPlaylistImageUrl = getValidArtworkUrl(storyCard.yotoPlaylistImageUrl);
+  const legacyYotoImageUrl = getValidArtworkUrl(storyCard.yotoCardImageUrl);
+  const podcastImageUrl = getValidArtworkUrl(storyCard.podcastImageUrl);
+  const explicitSource = normalizePlaylistImageSourceValue(storyCard.playlistImageSource);
+  if (explicitSource === "rss_fallback" && podcastImageUrl) {
+    return {
+      resolvedArtworkUrl: podcastImageUrl,
+      playlistImageSource: "rss_fallback",
+    };
+  }
+
+  const confirmedYotoUrl = yotoPlaylistImageUrl || legacyYotoImageUrl;
+  if (confirmedYotoUrl) {
+    return {
+      resolvedArtworkUrl: confirmedYotoUrl,
+      playlistImageSource: explicitSource === "rss_on_yoto" ? "rss_on_yoto" : "yoto_custom",
+    };
+  }
+
+  return {
+    resolvedArtworkUrl: podcastImageUrl || null,
+    playlistImageSource: podcastImageUrl ? "rss_fallback" : "placeholder",
+  };
+};
+
+const getSafeArtworkDetails = (storyCard, artworkChanged, extras = {}) => {
+  const resolved = getResolvedStoryCardArtwork(storyCard);
+  return {
+    storyCardId: String(storyCard?.id || "").trim(),
+    playlistImageSource: resolved.playlistImageSource,
+    artworkChanged: artworkChanged === true,
+    imageHost: getSafeUrlDetails(resolved.resolvedArtworkUrl).host || "",
+    playlistImageLastSyncedAt: toIsoString(storyCard?.playlistImageLastSyncedAt),
+    automaticApplyAttempted: extras.automaticApplyAttempted === true,
+    yotoConfirmed: extras.yotoConfirmed === true,
+  };
+};
+
+const getArtworkEventForSource = (source, { explicitReplacement = false } = {}) => {
+  if (explicitReplacement) {
+    return {
+      eventType: "playlist_artwork_replaced_from_rss",
+      title: "Yoto image replaced",
+      message: "Yoto image was replaced with the podcast image.",
+    };
+  }
+  if (source === "rss_on_yoto") {
+    return {
+      eventType: "playlist_artwork_auto_applied_from_rss",
+      title: "Podcast image added to Yoto",
+      message: "Podcast image was automatically added to the Story Playlist.",
+    };
+  }
+  if (source === "rss_fallback") {
+    return {
+      eventType: "playlist_artwork_using_rss_fallback",
+      title: "Using podcast image",
+      message: "Podcast image is being shown while Yoto artwork is unavailable.",
+    };
+  }
+  if (source === "yoto_custom") {
+    return {
+      eventType: "playlist_artwork_synced_from_yoto",
+      title: "Story Playlist image refreshed",
+      message: "Story Playlist image was refreshed from Yoto.",
+    };
+  }
+  return null;
+};
+
+const saveStoryCardArtworkState = async (storyCardId, fields = {}, logOptions = {}) => {
+  const storyCards = await readStoryCards();
+  const index = storyCards.findIndex((storyCard) => storyCard.id === storyCardId);
+  if (index === -1) throw createExposedError("Story Card not found.", 404);
+
+  const current = storyCards[index];
+  const previous = getResolvedStoryCardArtwork(current);
+  const next = normalizeStoryCard({ ...current, ...fields }, current);
+  const resolved = getResolvedStoryCardArtwork(next);
+  const artworkChanged = previous.resolvedArtworkUrl !== resolved.resolvedArtworkUrl;
+  const sourceChanged = previous.playlistImageSource !== resolved.playlistImageSource;
+  const trackedFields = [
+    "podcastImageUrl",
+    "yotoPlaylistImageUrl",
+    "playlistImageSource",
+    "lastPodcastImageAppliedUrl",
+    "lastPodcastImageAutoApplyAttemptUrl",
+    "playlistImageLastSyncedAt",
+    "playlistImageLastAutoApplyAttemptAt",
+    "playlistImageSyncStatus",
+    "playlistImageSyncMessage",
+  ];
+  const artworkLayoutChanged = (field) =>
+    Boolean(current[field]) !== Boolean(next[field]) ||
+    (Boolean(current[field]) && !arePlaylistArtworkLayoutsEqual(current[field], next[field]));
+  const fieldsChanged =
+    trackedFields.some((field) => (current[field] || "") !== (next[field] || "")) ||
+    artworkLayoutChanged("playlistArtworkLayout") ||
+    artworkLayoutChanged("lastPodcastArtworkLayout");
+  const needsMigration =
+    current.yotoPlaylistImageUrl !== next.yotoPlaylistImageUrl ||
+    current.playlistImageSource !== next.playlistImageSource;
+
+  if (fieldsChanged || artworkChanged || sourceChanged || needsMigration) {
+    storyCards[index] = next;
+    await writeStoryCards(storyCards);
+
+    const event = logOptions.event || getArtworkEventForSource(resolved.playlistImageSource, logOptions);
+    if (event && logOptions.log !== false && (artworkChanged || sourceChanged || logOptions.forceLog)) {
+      await addActivityLogEntry({
+        level: logOptions.level || "info",
+        storyCardId,
+        eventType: event.eventType,
+        title: event.title,
+        message: event.message,
+        details: getSafeArtworkDetails(next, artworkChanged, logOptions),
+      }).catch(() => {});
+    }
+
+    return {
+      storyCard: next,
+      ...resolved,
+      artworkChanged,
+      rssArtworkAppliedToYoto: logOptions.rssArtworkAppliedToYoto === true,
+      yotoConfirmed: logOptions.yotoConfirmed === true,
+    };
+  }
+
+  return {
+    storyCard: current,
+    ...previous,
+    artworkChanged: false,
+    rssArtworkAppliedToYoto: false,
+    yotoConfirmed: false,
+  };
+};
+
+const saveStoryCardArtworkFromYoto = async (storyCardId, yotoPlaylist, options = {}) => {
+  const storyCards = await readStoryCards();
+  const current = storyCards.find((storyCard) => storyCard.id === storyCardId);
+  if (!current) throw createExposedError("Story Card not found.", 404);
+
+  const yotoPlaylistImageUrl = getYotoPlaylistArtworkUrl(yotoPlaylist);
+  const currentSource = normalizePlaylistImageSourceValue(current.playlistImageSource);
+  const source = yotoPlaylistImageUrl
+    ? currentSource === "rss_on_yoto" &&
+        getValidArtworkUrl(current.lastPodcastImageAppliedUrl) === getValidArtworkUrl(current.podcastImageUrl)
+      ? "rss_on_yoto"
+      : "yoto_custom"
+    : getValidArtworkUrl(current.podcastImageUrl)
+      ? "rss_fallback"
+      : "placeholder";
+
+  return saveStoryCardArtworkState(storyCardId, {
+    yotoPlaylistImageUrl,
+    playlistImageSource: source,
+    playlistImageLastSyncedAt: new Date().toISOString(),
+    playlistImageSyncStatus: source === "rss_fallback" ? "fallback" : "synced",
+    playlistImageSyncMessage: "",
+  }, {
+    ...options,
+    yotoConfirmed: Boolean(yotoPlaylistImageUrl),
+  });
+};
+
+const shouldAttemptAutomaticPodcastArtworkApply = (storyCard) => {
+  const podcastImageUrl = getValidArtworkUrl(storyCard?.podcastImageUrl);
+  if (!podcastImageUrl || !storyCard?.yotoPlaylistId) return false;
+  if (normalizePlaylistImageSourceValue(storyCard.playlistImageSource) === "yoto_custom") return false;
+  if (getValidArtworkUrl(storyCard.lastPodcastImageAppliedUrl) === podcastImageUrl) return false;
+  return getValidArtworkUrl(storyCard.lastPodcastImageAutoApplyAttemptUrl) !== podcastImageUrl;
+};
+
+const applyPodcastArtworkToYoto = async (storyCardId, options = {}) => {
+  const { storyCard } = await getStoryCardOrThrow(storyCardId);
+  const podcastImageUrl = getValidArtworkUrl(storyCard.podcastImageUrl);
+  if (!podcastImageUrl) throw createExposedError("This Story Card does not have a podcast image to use.");
+  if (!storyCard.yotoPlaylistId) throw createExposedError("Choose a Story Playlist first.");
+
+  const currentPlaylist = options.yotoPlaylist
+    ? { card: options.yotoPlaylist, tokens: await getAuthenticatedTokens() }
+    : await getYotoPlaylistContent(storyCard);
+  if (!currentPlaylist.tokens) {
+    throw createExposedError("Connect Yoto to update this Story Playlist image.", 401);
+  }
+
+  const yotoPlaylist = currentPlaylist.card;
+  const currentYotoArtworkUrl = getYotoPlaylistArtworkUrl(yotoPlaylist);
+  const currentSource = normalizePlaylistImageSourceValue(storyCard.playlistImageSource);
+  const fallbackSource = currentYotoArtworkUrl
+    ? currentSource === "rss_on_yoto" ? "rss_on_yoto" : "yoto_custom"
+    : "rss_fallback";
+  const requestedArtworkLayout = normalizePlaylistArtworkLayout(
+    options.layout ?? storyCard.playlistArtworkLayout
+  );
+  const now = new Date().toISOString();
+
+  await saveStoryCardArtworkState(storyCardId, {
+    yotoPlaylistImageUrl: currentYotoArtworkUrl,
+    playlistImageSource: fallbackSource,
+    playlistImageSyncStatus: "applying",
+    playlistImageSyncMessage: "",
+  }, { log: false });
+
+  let latestYotoArtworkUrl = currentYotoArtworkUrl;
+  let uploadResult = null;
+
+  try {
+    const renderedArtwork = await renderPodcastArtworkForYoto(
+      podcastImageUrl,
+      requestedArtworkLayout
+    );
+    const uploadResponse = await postYotoCoverImageBufferWithRefresh(
+      renderedArtwork.imageBuffer,
+      currentPlaylist.tokens
+    );
+    uploadResult = uploadResponse.data;
+    const uploadedMediaUrl = getValidArtworkUrl(uploadResult?.coverImage?.mediaUrl);
+    if (!uploadedMediaUrl) {
+      throw createExposedError("Yoto did not return the uploaded cover image.", 502);
+    }
+
+    const updatePayload = buildYotoPlaylistArtworkUpdatePayload(
+      yotoPlaylist,
+      storyCard,
+      uploadedMediaUrl
+    );
+    await postYotoJsonWithRefresh("/content", uploadResponse.tokens, updatePayload);
+
+    const verifiedPlaylist = await getYotoPlaylistContent(storyCard);
+    latestYotoArtworkUrl = getYotoPlaylistArtworkUrl(verifiedPlaylist.card);
+    if (!isUploadedYotoCoverConfirmed(latestYotoArtworkUrl, uploadResult)) {
+      throw createExposedError("Yoto did not confirm the new Story Playlist image.", 502);
+    }
+
+    const result = await saveStoryCardArtworkState(storyCardId, {
+      yotoPlaylistImageUrl: latestYotoArtworkUrl,
+      playlistImageSource: "rss_on_yoto",
+      playlistArtworkLayout: renderedArtwork.layout,
+      lastPodcastArtworkLayout: renderedArtwork.layout,
+      lastPodcastImageAppliedUrl: podcastImageUrl,
+      lastPodcastImageAutoApplyAttemptUrl: options.automatic === true
+        ? podcastImageUrl
+        : storyCard.lastPodcastImageAutoApplyAttemptUrl,
+      playlistImageLastSyncedAt: new Date().toISOString(),
+      playlistImageLastAutoApplyAttemptAt: options.automatic === true
+        ? now
+        : storyCard.playlistImageLastAutoApplyAttemptAt,
+      playlistImageSyncStatus: "synced",
+      playlistImageSyncMessage: "",
+    }, {
+      automaticApplyAttempted: options.automatic === true,
+      explicitReplacement: options.explicitReplacement === true,
+      forceLog: true,
+      rssArtworkAppliedToYoto: true,
+      yotoConfirmed: true,
+    });
+
+    return {
+      ...result,
+      yotoConfirmed: true,
+      rssArtworkAppliedToYoto: true,
+      message: "Podcast image is now being used on this Story Playlist.",
+    };
+  } catch (error) {
+    const uploadWasConfirmed = isUploadedYotoCoverConfirmed(latestYotoArtworkUrl, uploadResult);
+    const failureSource = latestYotoArtworkUrl
+      ? uploadWasConfirmed || currentSource === "rss_on_yoto" ? "rss_on_yoto" : "yoto_custom"
+      : "rss_fallback";
+    const event = {
+      eventType: "playlist_artwork_sync_failed",
+      title: "Artwork could not be updated",
+      message: "Feed Your Yoto could not update the artwork right now.",
+    };
+    const result = await saveStoryCardArtworkState(storyCardId, {
+      yotoPlaylistImageUrl: latestYotoArtworkUrl,
+      playlistImageSource: failureSource,
+      lastPodcastImageAutoApplyAttemptUrl: options.automatic === true
+        ? podcastImageUrl
+        : storyCard.lastPodcastImageAutoApplyAttemptUrl,
+      playlistImageLastSyncedAt: new Date().toISOString(),
+      playlistImageLastAutoApplyAttemptAt: options.automatic === true
+        ? now
+        : storyCard.playlistImageLastAutoApplyAttemptAt,
+      playlistImageSyncStatus: "failed",
+      playlistImageSyncMessage: "Feed Your Yoto could not update the Yoto image right now.",
+    }, {
+      automaticApplyAttempted: options.automatic === true,
+      event,
+      forceLog: true,
+      level: "warning",
+    });
+
+    return {
+      ...result,
+      yotoConfirmed: false,
+      rssArtworkAppliedToYoto: false,
+      message: "Feed Your Yoto could not update the Yoto image right now.",
+    };
+  }
+};
+
+const backfillMissingPodcastArtwork = async (storyCard) => {
+  if (
+    !storyCard?.id ||
+    getValidArtworkUrl(storyCard.podcastImageUrl) ||
+    !isHttpUrl(storyCard.podcastLink)
+  ) {
+    return storyCard;
+  }
+
+  try {
+    const xml = await fetchPodcastFeedXml(validatePodcastLink(storyCard.podcastLink));
+    const podcastImageUrl = getPodcastImageUrl(getPodcastChannelXml(xml));
+    if (!getValidArtworkUrl(podcastImageUrl)) return storyCard;
+
+    await syncStoryCardPodcastArtwork(storyCard.id, podcastImageUrl);
+    return (await getStoryCardOrThrow(storyCard.id)).storyCard;
+  } catch (error) {
+    // Older Story Cards may not have saved RSS artwork yet. A feed problem should
+    // not prevent their confirmed Yoto artwork from refreshing.
+    console.warn("Could not backfill podcast artwork.", error.message);
+    return storyCard;
+  }
+};
+
+const syncStoryCardArtwork = async (storyCardId, options = {}) => {
+  try {
+    const current = await getStoryCardOrThrow(storyCardId);
+    const storyCard = options.refreshPodcastArtwork === false
+      ? current.storyCard
+      : await backfillMissingPodcastArtwork(current.storyCard);
+    const yotoPlaylist = hasOwn(options, "yotoPlaylist")
+      ? options.yotoPlaylist
+      : (await getYotoPlaylistContent(storyCard)).card;
+    const yotoPlaylistImageUrl = getYotoPlaylistArtworkUrl(yotoPlaylist);
+    const currentSource = normalizePlaylistImageSourceValue(storyCard.playlistImageSource);
+    const podcastImageUrl = getValidArtworkUrl(storyCard.podcastImageUrl);
+
+    if (
+      options.allowAutomaticRssApply !== false &&
+      podcastImageUrl &&
+      ((!yotoPlaylistImageUrl && shouldAttemptAutomaticPodcastArtworkApply(storyCard)) ||
+        (yotoPlaylistImageUrl &&
+          currentSource === "rss_on_yoto" &&
+          getValidArtworkUrl(storyCard.lastPodcastImageAppliedUrl) !== podcastImageUrl))
+    ) {
+      return await applyPodcastArtworkToYoto(storyCardId, {
+        automatic: true,
+        yotoPlaylist,
+      });
+    }
+
+    return await saveStoryCardArtworkFromYoto(storyCardId, yotoPlaylist, options);
+  } catch (error) {
+    const current = await getStoryCardOrThrow(storyCardId).catch(() => ({ storyCard: null }));
+    const storyCard = current.storyCard;
+    if (options.logFailure !== false && storyCard) {
+      await addActivityLogEntry({
+        level: "warning",
+        storyCardId,
+        eventType: "playlist_artwork_sync_failed",
+        title: "Artwork could not be refreshed",
+        message: "Feed Your Yoto could not refresh the artwork right now.",
+        details: getSafeArtworkDetails(storyCard, false),
+      }).catch(() => {});
+    }
+
+    const resolved = getResolvedStoryCardArtwork(storyCard || {});
+    return {
+      storyCard,
+      ...resolved,
+      artworkChanged: false,
+      syncFailed: true,
+    };
+  }
+};
+
+const syncStoryCardArtworkFromYoto = syncStoryCardArtwork;
+
+const syncAllStoryCardArtworkFromYoto = async ({ logFailure = false } = {}) => {
+  const currentCards = await readStoryCards();
+  for (const storyCard of currentCards) {
+    if (!storyCard.yotoPlaylistId) continue;
+    await syncStoryCardArtworkFromYoto(storyCard.id, { logFailure });
+  }
+  return readStoryCards();
+};
+
+const syncStoryCardArtworkFromYotoCards = async (yotoCards = []) => {
+  const storyCards = await readStoryCards();
+  const yotoCardsById = new Map(yotoCards.map((card) => [String(card.id || ""), card]));
+  for (const storyCard of storyCards) {
+    const yotoCard = yotoCardsById.get(String(storyCard.yotoPlaylistId || ""));
+    if (!yotoCard?.artworkInspected) continue;
+    await syncStoryCardArtworkFromYoto(storyCard.id, {
+      yotoPlaylist: { imageUrl: yotoCard.imageUrl },
+      logFailure: false,
+    });
+  }
+};
+
+const syncStoryCardPodcastArtwork = async (storyCardId, podcastImageUrl) => {
+  const storyCards = await readStoryCards();
+  const index = storyCards.findIndex((storyCard) => storyCard.id === storyCardId);
+  if (index === -1) throw createExposedError("Story Card not found.", 404);
+
+  const current = storyCards[index];
+  const nextUrl = getValidArtworkUrl(podcastImageUrl);
+  if (getValidArtworkUrl(current.podcastImageUrl) === nextUrl) return current;
+
+  const previous = getResolvedStoryCardArtwork(current);
+  const next = normalizeStoryCard({ ...current, podcastImageUrl: nextUrl }, current);
+  const resolved = getResolvedStoryCardArtwork(next);
+  storyCards[index] = next;
+  await writeStoryCards(storyCards);
+
+  if (resolved.playlistImageSource === "rss_fallback" && previous.resolvedArtworkUrl !== resolved.resolvedArtworkUrl) {
+    await addActivityLogEntry({
+      level: "info",
+      storyCardId,
+      eventType: "playlist_artwork_using_rss_fallback",
+      title: "Using podcast image",
+      message: "Podcast image is being shown while Yoto artwork is unavailable.",
+      details: getSafeArtworkDetails(next, true),
+    });
+  }
+  return next;
+};
 
 const isStreamTrack = (track) => {
   if (!track || typeof track !== "object") return false;
@@ -4723,9 +5550,11 @@ const getSafeYotoCards = async () => {
       compatible: !hasStreams,
       hasStreams,
       imageUrl: getCardImageUrl(source, card),
+      artworkInspected: Boolean(detailCard),
     });
   }
 
+  await syncStoryCardArtworkFromYotoCards(safeCards);
   return safeCards;
 };
 
@@ -4819,6 +5648,8 @@ const handleApi = async (request, response, pathname) => {
     const syncPlaylistRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/sync-playlist\/?$/);
     const cleanupRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/cleanup\/?$/);
     const runNowRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/run-now\/?$/);
+    const artworkSyncRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/artwork\/sync\/?$/);
+    const artworkUsePodcastImageRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/artwork\/use-podcast-image\/?$/);
     const storyActivityRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/([^/]+)\/activity\/?$/);
     const storyDownloadSelectedRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/download-selected\/?$/);
     const storyUploadReadyRoute = pathname.match(/^\/api\/story-cards\/([^/]+)\/stories\/upload-ready\/?$/);
@@ -4918,6 +5749,26 @@ const handleApi = async (request, response, pathname) => {
       return;
     }
 
+    if (request.method === "POST" && artworkSyncRoute) {
+      const storyCardId = decodeURIComponent(artworkSyncRoute[1]);
+      const body = await readRequestJson(request).catch(() => ({}));
+      sendJson(response, 200, await syncStoryCardArtwork(storyCardId, {
+        allowAutomaticRssApply: body.forceRefreshFromYoto ? false : body.allowAutomaticRssApply !== false,
+        forceRefreshFromYoto: body.forceRefreshFromYoto === true,
+      }));
+      return;
+    }
+
+    if (request.method === "POST" && artworkUsePodcastImageRoute) {
+      const storyCardId = decodeURIComponent(artworkUsePodcastImageRoute[1]);
+      const body = await readRequestJson(request).catch(() => ({}));
+      sendJson(response, 200, await applyPodcastArtworkToYoto(storyCardId, {
+        explicitReplacement: true,
+        layout: body.layout,
+      }));
+      return;
+    }
+
     if (request.method === "POST" && storyDownloadSelectedRoute) {
       const storyCardId = decodeURIComponent(storyDownloadSelectedRoute[1]);
       sendJson(response, 200, await downloadSelectedStories(storyCardId));
@@ -4952,7 +5803,11 @@ const handleApi = async (request, response, pathname) => {
     }
 
     if (request.method === "GET" && isStoryCardsRoute) {
-      sendJson(response, 200, await readStoryCards());
+      const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+      const storyCards = url.searchParams.get("syncArtwork") === "false"
+        ? await readStoryCards()
+        : await syncAllStoryCardArtworkFromYoto({ logFailure: false });
+      sendJson(response, 200, storyCards);
       return;
     }
 

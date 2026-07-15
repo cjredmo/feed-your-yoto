@@ -1041,6 +1041,10 @@ h2 {
   z-index: 25;
 }
 
+.podcast-image-backdrop {
+  z-index: 28;
+}
+
 .editor-dialog {
   width: min(1080px, 100%);
   max-height: calc(100vh - 56px);
@@ -1106,6 +1110,35 @@ h2 {
   font-size: 14px;
   font-weight: 800;
   line-height: 1.45;
+}
+
+.dialog-artwork-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.dialog-artwork-actions[hidden] {
+  display: none;
+}
+
+.light-action {
+  min-height: 38px;
+  border: 2px solid rgba(255, 255, 255, 0.72);
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.13);
+  font-size: 14px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.light-action:hover,
+.light-action:focus-visible {
+  background: rgba(255, 255, 255, 0.22);
+  outline: none;
 }
 
 .dialog-form {
@@ -2827,6 +2860,178 @@ h2 {
   box-shadow: 0 28px 70px rgba(23, 52, 119, 0.24);
 }
 
+.podcast-image-dialog {
+  width: min(820px, 100%);
+  max-height: calc(100vh - 56px);
+  display: grid;
+  gap: 18px;
+  overflow: auto;
+  padding: 28px;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 28px 70px rgba(23, 52, 119, 0.24);
+}
+
+.podcast-image-content {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.podcast-image-preview-column {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+}
+
+.podcast-image-preview {
+  position: relative;
+  width: min(280px, 100%);
+  aspect-ratio: 638 / 1011;
+  justify-self: center;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(28, 62, 133, 0.14);
+  border-radius: 26px;
+  background: var(--blue-soft);
+  box-shadow: 0 16px 34px rgba(23, 52, 119, 0.16);
+}
+
+.podcast-image-preview img,
+.podcast-image-placeholder {
+  width: 100%;
+  height: 100%;
+}
+
+.podcast-image-preview img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  transition: transform 120ms ease, object-position 120ms ease;
+}
+
+.podcast-image-placeholder {
+  position: absolute;
+  inset: 0;
+}
+
+.podcast-image-preview-label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.podcast-image-editor {
+  min-width: 0;
+  display: grid;
+  gap: 18px;
+}
+
+.podcast-image-copy {
+  display: grid;
+  gap: 8px;
+  color: var(--blue-dark);
+  text-align: left;
+}
+
+.podcast-image-copy strong {
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.podcast-image-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.artwork-layout-controls {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(28, 62, 133, 0.12);
+  border-radius: 8px;
+  background: #f7f8fd;
+}
+
+.artwork-layout-control {
+  display: grid;
+  gap: 7px;
+  color: var(--blue-dark);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.artwork-layout-control > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.artwork-layout-control select {
+  min-height: 42px;
+  width: 100%;
+  border: 1px solid rgba(28, 62, 133, 0.25);
+  border-radius: 7px;
+  padding: 0 12px;
+  color: var(--blue-dark);
+  background: #ffffff;
+  font: inherit;
+}
+
+.artwork-range-control input[type="range"] {
+  width: 100%;
+  accent-color: var(--purple);
+}
+
+.artwork-color-control {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.artwork-color-control input[type="color"] {
+  width: 54px;
+  height: 38px;
+  border: 1px solid rgba(28, 62, 133, 0.2);
+  border-radius: 7px;
+  padding: 3px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.artwork-layout-help {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.artwork-reset-button {
+  justify-self: start;
+  min-width: 0;
+}
+
+.podcast-image-message {
+  min-height: 22px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1.35;
+}
+
+.podcast-image-message.is-success {
+  color: #11633d;
+}
+
+.podcast-image-message.is-error {
+  color: #8a1e31;
+}
+
 .setup-progress {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3495,6 +3700,20 @@ h2 {
   .setup-progress,
   .setup-option-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .podcast-image-content {
+    grid-template-columns: 1fr;
+  }
+
+  .podcast-image-preview {
+    width: min(240px, 78vw);
+  }
+
+  .podcast-image-copy {
+    text-align: center;
   }
 }
 

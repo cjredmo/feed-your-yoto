@@ -134,6 +134,7 @@
             <p id="dialogStatus" class="status-pill status-live">Updating</p>
             <p id="dialogCrawl" class="next-crawl-line">Next Check: Jun 28, 2026, 7:30 PM</p>
             <p id="dialogPodcastDescription" class="dialog-podcast-description"></p>
+            <div id="dialogArtworkActions" class="dialog-artwork-actions"></div>
           </div>
         </div>
 
@@ -318,6 +319,36 @@
             <button id="saveCard" class="primary-action" type="button">Save Story Card</button>
           </div>
         </form>
+      </section>
+    </div>
+
+    <div id="podcastImageBackdrop" class="dialog-backdrop podcast-image-backdrop" hidden>
+      <section
+        class="podcast-image-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="podcastImageTitle"
+      >
+        <div class="dialog-topline">
+          <div>
+            <p class="eyebrow">Podcast Artwork</p>
+            <h2 id="podcastImageTitle">Podcast Image</h2>
+          </div>
+          <button id="closePodcastImageDialog" class="icon-button close-button" type="button" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+
+        <div id="podcastImageContent" class="podcast-image-content"></div>
+
+        <div class="dialog-actions">
+          <span id="podcastImageMessage" class="podcast-image-message" role="status"></span>
+          <span class="dialog-action-spacer" aria-hidden="true"></span>
+          <button id="cancelPodcastImageDialog" class="quiet-action" type="button">Close</button>
+          <button id="replacePodcastImageButton" class="primary-action" type="button">
+            Replace Yoto Image with Podcast Image
+          </button>
+        </div>
       </section>
     </div>
 

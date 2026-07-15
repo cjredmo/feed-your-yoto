@@ -35,6 +35,21 @@ let storyQueuePollInFlight = false;
 let storyQueuePollSignature = "";
 let storyQueuePollUnchangedCount = 0;
 const storyTrackerPreviousSteps = new Map();
+const failedArtworkUrls = new Set();
+
+const hasArtworkImageFailed = (imageUrl) => failedArtworkUrls.has(String(imageUrl || ""));
+
+window.handleArtworkImageError = (image) => {
+  const source = image?.getAttribute?.("src") || "";
+  const currentSource = image?.currentSrc || image?.src || "";
+  if (source) failedArtworkUrls.add(source);
+  if (currentSource) failedArtworkUrls.add(currentSource);
+  if (!image) return;
+  image.hidden = true;
+  image.parentElement?.classList.add("is-image-missing");
+  const placeholder = image.nextElementSibling;
+  if (placeholder) placeholder.hidden = false;
+};
 
 const YOTO_PROCESSING_MESSAGE = "Yoto is still getting this story ready. Feed Your Yoto will try again soon.";
 const MISSING_AUDIO_DOWNLOAD_MESSAGE =
@@ -134,6 +149,7 @@ const dialogTitle = document.querySelector("#dialogTitle");
 const dialogStatus = document.querySelector("#dialogStatus");
 const dialogCrawl = document.querySelector("#dialogCrawl");
 const dialogPodcastDescription = document.querySelector("#dialogPodcastDescription");
+const dialogArtworkActions = document.querySelector("#dialogArtworkActions");
 const automaticScheduleStatus = document.querySelector("#automaticScheduleStatus");
 const playlistName = document.querySelector("#playlistName");
 const rssFeed = document.querySelector("#rssFeed");
@@ -143,6 +159,12 @@ const setupDetailsPanel = document.querySelector("#setupDetailsPanel");
 const setupChangeAcknowledged = document.querySelector("#setupChangeAcknowledged");
 const podcastChangeCode = document.querySelector("#podcastChangeCode");
 const closeDialog = document.querySelector("#closeDialog");
+const podcastImageBackdrop = document.querySelector("#podcastImageBackdrop");
+const podcastImageContent = document.querySelector("#podcastImageContent");
+const podcastImageMessage = document.querySelector("#podcastImageMessage");
+const closePodcastImageDialog = document.querySelector("#closePodcastImageDialog");
+const cancelPodcastImageDialog = document.querySelector("#cancelPodcastImageDialog");
+const replacePodcastImageButton = document.querySelector("#replacePodcastImageButton");
 const addCardButton = document.querySelector("#addCardButton");
 const showAllButton = document.querySelector("#showAllButton");
 const saveCard = document.querySelector("#saveCard");
@@ -179,6 +201,13 @@ let setupStep = 0;
 let setupDraft = getFreshSetupDraft();
 let yotoCardsLoadId = 0;
 let setupDetailsUnlocked = false;
+let podcastImageModalState = {
+  storyCardId: "",
+  busy: false,
+  message: "",
+  messageType: "",
+  layout: null,
+};
 
 function getFreshSetupDraft() {
   return {
@@ -210,6 +239,45 @@ const escapeHtml = (value) =>
 
 const escapeAttribute = escapeHtml;
 
+const getValidArtworkUrl = (value) => {
+  try {
+    const url = new URL(String(value || ""));
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+};
+
+const DEFAULT_PLAYLIST_ARTWORK_LAYOUT = Object.freeze({
+  fit: "contain",
+  zoom: 100,
+  positionX: 50,
+  positionY: 50,
+  backgroundColor: "#ffffff",
+});
+
+const normalizePlaylistArtworkLayout = (value = {}) => {
+  const clamp = (input, min, max, fallback) => {
+    const number = Number(input);
+    return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
+  };
+  const backgroundColor = String(value?.backgroundColor || "").trim().toLowerCase();
+  return {
+    fit: value?.fit === "cover" ? "cover" : "contain",
+    zoom: clamp(value?.zoom, 100, 200, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.zoom),
+    positionX: clamp(value?.positionX, 0, 100, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.positionX),
+    positionY: clamp(value?.positionY, 0, 100, DEFAULT_PLAYLIST_ARTWORK_LAYOUT.positionY),
+    backgroundColor: /^#[0-9a-f]{6}$/.test(backgroundColor)
+      ? backgroundColor
+      : DEFAULT_PLAYLIST_ARTWORK_LAYOUT.backgroundColor,
+  };
+};
+
+const arePlaylistArtworkLayoutsEqual = (first, second) =>
+  JSON.stringify(normalizePlaylistArtworkLayout(first)) ===
+  JSON.stringify(normalizePlaylistArtworkLayout(second));
+
 const getPlainTextFromMarkup = (value) => {
   const rawText = String(value || "").trim();
   if (!rawText) return "";
@@ -226,7 +294,11 @@ const truncateText = (value, maxLength = 260) => {
 };
 
 const setModalLock = () => {
-  const modalOpen = !backdrop.hidden || !setupBackdrop.hidden || !authBackdrop.hidden;
+  const modalOpen =
+    !backdrop.hidden ||
+    !setupBackdrop.hidden ||
+    !authBackdrop.hidden ||
+    !podcastImageBackdrop.hidden;
   document.body.classList.toggle("dialog-open", modalOpen);
 };
 
@@ -267,8 +339,9 @@ const setButtonBusy = (button, busy, busyText) => {
   return previousText;
 };
 
-const refreshStoryCardCache = async () => {
-  const savedStoryCards = await apiRequest("/api/story-cards");
+const refreshStoryCardCache = async ({ syncArtwork = true } = {}) => {
+  const path = syncArtwork ? "/api/story-cards" : "/api/story-cards?syncArtwork=false";
+  const savedStoryCards = await apiRequest(path);
   storyCards = Array.isArray(savedStoryCards) ? savedStoryCards : [];
 };
 
@@ -438,7 +511,7 @@ const getPlaylistArtMarkup = (card) => {
     </span>
   `;
 
-  if (!card?.imageUrl) return placeholder;
+  if (!card?.imageUrl || hasArtworkImageFailed(card.imageUrl)) return placeholder;
 
   return `
     <span class="playlist-art-frame">
@@ -446,7 +519,7 @@ const getPlaylistArtMarkup = (card) => {
         src="${escapeAttribute(card.imageUrl)}"
         alt=""
         class="playlist-art"
-        onerror="this.hidden=true; this.parentElement.classList.add('is-image-missing');"
+        onerror="window.handleArtworkImageError(this)"
       />
       ${placeholder}
     </span>
@@ -456,8 +529,14 @@ const getPlaylistArtMarkup = (card) => {
 const getStoryCardPlaylistTitle = (storyCard) =>
   storyCard?.yotoPlaylistTitle || storyCard?.yotoCardName || "Story Playlist";
 
-const getStoryCardPlaylistImageUrl = (storyCard) =>
-  storyCard?.yotoPlaylistImageUrl || storyCard?.yotoCardImageUrl || null;
+const getResolvedStoryCardArtworkUrl = (storyCard) =>
+  getValidArtworkUrl(storyCard?.yotoPlaylistImageUrl) ||
+  getValidArtworkUrl(storyCard?.podcastImageUrl) ||
+  getValidArtworkUrl(storyCard?.yotoCardImageUrl) ||
+  null;
+
+const getPodcastImageUrlForStoryCard = (storyCard) =>
+  getValidArtworkUrl(storyCard?.podcastImageUrl);
 
 const getStoryCardNextCheckLabel = (storyCard) => {
   if (!isAutomaticChecksEnabled(storyCard)) return "Only when I press Refresh Stories";
@@ -490,14 +569,14 @@ const getAutomaticResultText = (storyCard) => {
 
 const getStoryCardArtMarkup = (storyCard) => {
   const title = getStoryCardPlaylistTitle(storyCard);
-  const imageUrl = getStoryCardPlaylistImageUrl(storyCard);
+  const imageUrl = getResolvedStoryCardArtworkUrl(storyCard);
   const placeholder = `
     <span class="playlist-art-placeholder" aria-hidden="true">
       ${escapeHtml(getPlaylistInitials(title))}
     </span>
   `;
 
-  if (!imageUrl) return placeholder;
+  if (!imageUrl || hasArtworkImageFailed(imageUrl)) return placeholder;
 
   return `
     <span class="playlist-art-frame">
@@ -505,7 +584,7 @@ const getStoryCardArtMarkup = (storyCard) => {
         src="${escapeAttribute(imageUrl)}"
         alt=""
         class="playlist-art"
-        onerror="this.hidden=true; this.parentElement.classList.add('is-image-missing');"
+        onerror="window.handleArtworkImageError(this)"
       />
       ${placeholder}
     </span>
@@ -613,9 +692,9 @@ const renderPodcastPreview = () => {
   return `
     <article class="podcast-preview-card">
       ${
-        preview.imageUrl
+        preview.imageUrl && !hasArtworkImageFailed(preview.imageUrl)
           ? `<span class="podcast-preview-art">
-              <img class="podcast-preview-image" src="${escapeAttribute(preview.imageUrl)}" alt="" onerror="this.hidden=true; this.nextElementSibling.hidden=false;" />
+              <img class="podcast-preview-image" src="${escapeAttribute(preview.imageUrl)}" alt="" onerror="window.handleArtworkImageError(this)" />
               <span class="playlist-art-placeholder podcast-preview-placeholder" aria-hidden="true" hidden>${escapeHtml(getPlaylistInitials(preview.title))}</span>
             </span>`
           : `<span class="playlist-art-placeholder podcast-preview-placeholder" aria-hidden="true">${escapeHtml(getPlaylistInitials(preview.title))}</span>`
@@ -2326,8 +2405,12 @@ const discoverStories = async (storyCardId = activeCardId) => {
       `/api/story-cards/${encodeURIComponent(storyCardId)}/stories/discover`,
       { method: "POST" }
     );
-    await refreshStoryCardCache();
+    await refreshStoryCardCache({ syncArtwork: false });
     renderCards();
+    const refreshedCard = storyCards.find((storyCard) => storyCard.id === storyCardId);
+    if (refreshedCard && activeCardId === storyCardId && !backdrop.hidden) {
+      updateEditorPreview(refreshedCard);
+    }
     const nextStories = mergeStoryQueueUiState(Array.isArray(stories) ? stories : []);
     setStoryQueueState({
       status: "loaded",
@@ -2958,6 +3041,24 @@ const updateEditorPreview = (storyCard) => {
     dialogPodcastDescription.hidden = !podcastDescription;
   }
 
+  if (dialogArtworkActions) {
+    const hasPodcastImage = Boolean(getPodcastImageUrlForStoryCard(storyCard));
+    const hasYotoPlaylist = Boolean(storyCard.yotoPlaylistId);
+    dialogArtworkActions.innerHTML = `
+      ${
+        hasPodcastImage
+          ? `<button class="light-action" type="button" data-see-podcast-image>See Podcast Image</button>`
+          : ""
+      }
+      ${
+        hasYotoPlaylist
+          ? `<button class="light-action" type="button" data-refresh-yoto-image>Refresh Image from Yoto</button>`
+          : ""
+      }
+    `;
+    dialogArtworkActions.hidden = !hasPodcastImage && !hasYotoPlaylist;
+  }
+
   if (automaticScheduleStatus) {
     automaticScheduleStatus.innerHTML = `
       <div>
@@ -2986,6 +3087,298 @@ const updateEditorPreview = (storyCard) => {
   }
 };
 
+const isPodcastImageConfirmedOnYoto = (storyCard = {}, selectedLayout = null) => {
+  const podcastImageUrl = getPodcastImageUrlForStoryCard(storyCard);
+  if (!podcastImageUrl) return false;
+  return storyCard.playlistImageSource === "rss_on_yoto" &&
+    getValidArtworkUrl(storyCard.lastPodcastImageAppliedUrl) === podcastImageUrl &&
+    Boolean(storyCard.lastPodcastArtworkLayout) &&
+    arePlaylistArtworkLayoutsEqual(
+      storyCard.lastPodcastArtworkLayout,
+      selectedLayout || storyCard.lastPodcastArtworkLayout
+    );
+};
+
+const getPodcastImageModalStoryCard = () =>
+  storyCards.find((storyCard) => storyCard.id === podcastImageModalState.storyCardId);
+
+const updatePodcastImageEditorPreview = () => {
+  const storyCard = getPodcastImageModalStoryCard();
+  if (!storyCard || !podcastImageContent) return;
+
+  const layout = normalizePlaylistArtworkLayout(podcastImageModalState.layout);
+  podcastImageModalState.layout = layout;
+  const preview = podcastImageContent.querySelector("[data-artwork-preview]");
+  const image = podcastImageContent.querySelector("[data-artwork-preview-image]");
+  if (preview) preview.style.backgroundColor = layout.backgroundColor;
+  if (image) {
+    image.style.objectFit = layout.fit;
+    image.style.objectPosition = `${layout.positionX}% ${layout.positionY}%`;
+    image.style.transform = `scale(${layout.zoom / 100})`;
+    image.style.transformOrigin = `${layout.positionX}% ${layout.positionY}%`;
+  }
+
+  const values = {
+    zoom: `${layout.zoom}%`,
+    positionX: `${layout.positionX}%`,
+    positionY: `${layout.positionY}%`,
+  };
+  Object.entries(values).forEach(([key, value]) => {
+    const output = podcastImageContent.querySelector(`[data-artwork-output="${key}"]`);
+    if (output) output.textContent = value;
+  });
+  const help = podcastImageContent.querySelector("[data-artwork-layout-help]");
+  if (help) {
+    help.textContent = layout.fit === "contain"
+      ? "Shows the whole podcast image and uses the background color around it."
+      : "Fills the card. Use zoom and position to choose what stays visible.";
+  }
+
+  const isConfirmed = isPodcastImageConfirmedOnYoto(storyCard, layout);
+  const canReplace =
+    Boolean(getPodcastImageUrlForStoryCard(storyCard) && storyCard.yotoPlaylistId) &&
+    !podcastImageModalState.busy &&
+    !isConfirmed;
+  podcastImageContent.querySelectorAll("[data-artwork-layout]").forEach((control) => {
+    control.disabled = podcastImageModalState.busy;
+  });
+  const resetButton = podcastImageContent.querySelector("[data-reset-artwork-layout]");
+  if (resetButton) resetButton.disabled = podcastImageModalState.busy;
+
+  if (replacePodcastImageButton) {
+    replacePodcastImageButton.disabled = !canReplace;
+    replacePodcastImageButton.textContent = podcastImageModalState.busy
+      ? "Updating Yoto Image..."
+      : isConfirmed
+        ? "Podcast Image Is Already on Yoto"
+        : "Use This Image on Yoto";
+  }
+};
+
+const renderPodcastImageModal = () => {
+  const storyCard = getPodcastImageModalStoryCard();
+  if (!storyCard || !podcastImageContent) return;
+
+  const podcastImageUrl = getPodcastImageUrlForStoryCard(storyCard);
+  const podcastTitle = storyCard.podcastTitle || storyCard.name || "Podcast";
+  const layout = normalizePlaylistArtworkLayout(
+    podcastImageModalState.layout || storyCard.playlistArtworkLayout || storyCard.lastPodcastArtworkLayout
+  );
+  podcastImageModalState.layout = layout;
+
+  podcastImageContent.innerHTML = `
+    <div class="podcast-image-preview-column">
+      <div class="podcast-image-preview" data-artwork-preview style="background-color:${escapeAttribute(layout.backgroundColor)}">
+        ${
+          podcastImageUrl && !hasArtworkImageFailed(podcastImageUrl)
+            ? `<img
+                src="${escapeAttribute(podcastImageUrl)}"
+                alt=""
+                data-artwork-preview-image
+                style="object-fit:${layout.fit};object-position:${layout.positionX}% ${layout.positionY}%;transform:scale(${layout.zoom / 100});transform-origin:${layout.positionX}% ${layout.positionY}%"
+                onerror="window.handleArtworkImageError(this)"
+              />
+              <span class="playlist-art-placeholder podcast-image-placeholder" aria-hidden="true" hidden>${escapeHtml(getPlaylistInitials(podcastTitle))}</span>`
+            : `<span class="playlist-art-placeholder podcast-image-placeholder" aria-hidden="true">${escapeHtml(getPlaylistInitials(podcastTitle))}</span>`
+        }
+      </div>
+      <span class="podcast-image-preview-label">Yoto card preview</span>
+    </div>
+    <div class="podcast-image-editor">
+      <div class="podcast-image-copy">
+        <strong>${escapeHtml(podcastTitle)}</strong>
+        <p>This is the main image provided by the podcast's RSS feed.</p>
+      </div>
+      <div class="artwork-layout-controls">
+        <label class="artwork-layout-control">
+          <span>Framing</span>
+          <select data-artwork-layout="fit">
+            <option value="contain" ${layout.fit === "contain" ? "selected" : ""}>Fit Entire Image</option>
+            <option value="cover" ${layout.fit === "cover" ? "selected" : ""}>Fill the Card</option>
+          </select>
+        </label>
+        <p class="artwork-layout-help" data-artwork-layout-help>
+          ${layout.fit === "contain"
+            ? "Shows the whole podcast image and uses the background color around it."
+            : "Fills the card. Use zoom and position to choose what stays visible."}
+        </p>
+        <label class="artwork-layout-control artwork-range-control">
+          <span>Image size <output data-artwork-output="zoom">${layout.zoom}%</output></span>
+          <input type="range" min="100" max="200" step="1" value="${layout.zoom}" data-artwork-layout="zoom" />
+        </label>
+        <label class="artwork-layout-control artwork-range-control">
+          <span>Move left or right <output data-artwork-output="positionX">${layout.positionX}%</output></span>
+          <input type="range" min="0" max="100" step="1" value="${layout.positionX}" data-artwork-layout="positionX" />
+        </label>
+        <label class="artwork-layout-control artwork-range-control">
+          <span>Move up or down <output data-artwork-output="positionY">${layout.positionY}%</output></span>
+          <input type="range" min="0" max="100" step="1" value="${layout.positionY}" data-artwork-layout="positionY" />
+        </label>
+        <label class="artwork-layout-control artwork-color-control">
+          <span>Background color</span>
+          <input type="color" value="${escapeAttribute(layout.backgroundColor)}" data-artwork-layout="backgroundColor" />
+        </label>
+        <button class="quiet-action artwork-reset-button" type="button" data-reset-artwork-layout>Reset framing</button>
+      </div>
+    </div>
+  `;
+
+  if (podcastImageMessage) {
+    podcastImageMessage.textContent = podcastImageModalState.message;
+    podcastImageMessage.className = `podcast-image-message ${podcastImageModalState.messageType ? `is-${podcastImageModalState.messageType}` : ""}`;
+  }
+  updatePodcastImageEditorPreview();
+};
+
+const openPodcastImageModal = (storyCard) => {
+  if (!storyCard || !getPodcastImageUrlForStoryCard(storyCard)) return;
+  podcastImageModalState = {
+    storyCardId: storyCard.id,
+    busy: false,
+    message: "",
+    messageType: "",
+    layout: normalizePlaylistArtworkLayout(
+      storyCard.playlistArtworkLayout || storyCard.lastPodcastArtworkLayout
+    ),
+  };
+  renderPodcastImageModal();
+  podcastImageBackdrop.hidden = false;
+  setModalLock();
+  window.setTimeout(() => closePodcastImageDialog?.focus(), 0);
+};
+
+const closePodcastImageModal = () => {
+  podcastImageBackdrop.hidden = true;
+  podcastImageModalState = {
+    storyCardId: "",
+    busy: false,
+    message: "",
+    messageType: "",
+    layout: null,
+  };
+  setModalLock();
+};
+
+const replaceYotoImageWithPodcastImage = async () => {
+  const storyCard = getPodcastImageModalStoryCard();
+  if (!storyCard || podcastImageModalState.busy) return;
+  if (!requireAuth("Connect Yoto to update the Story Playlist image.")) return;
+
+  podcastImageModalState = {
+    ...podcastImageModalState,
+    busy: true,
+    message: "",
+    messageType: "",
+  };
+  renderPodcastImageModal();
+
+  try {
+    const result = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(storyCard.id)}/artwork/use-podcast-image`,
+      "POST",
+      { layout: normalizePlaylistArtworkLayout(podcastImageModalState.layout) }
+    );
+    if (result?.storyCard) applyStoryCardArtworkUpdate(result.storyCard);
+    const succeeded = result?.yotoConfirmed === true;
+    podcastImageModalState = {
+      ...podcastImageModalState,
+      busy: false,
+      message: succeeded
+        ? "Podcast image is now being used on this Story Playlist."
+        : result?.message || "Feed Your Yoto could not update the Yoto image right now.",
+      messageType: succeeded ? "success" : "error",
+    };
+  } catch (error) {
+    podcastImageModalState = {
+      ...podcastImageModalState,
+      busy: false,
+      message: error.message || "Feed Your Yoto could not update the Yoto image right now.",
+      messageType: "error",
+    };
+  }
+
+  renderPodcastImageModal();
+};
+
+const refreshActiveImageFromYoto = async () => {
+  const activeCard = getActiveStoryCard();
+  if (!activeCard || !requireAuth("Connect Yoto to refresh the Story Playlist image.")) return;
+  try {
+    const result = await jsonRequest(
+      `/api/story-cards/${encodeURIComponent(activeCard.id)}/artwork/sync`,
+      "POST",
+      { forceRefreshFromYoto: true, allowAutomaticRssApply: false }
+    );
+    if (result?.storyCard) applyStoryCardArtworkUpdate(result.storyCard);
+  } catch (error) {
+    dialogCrawl.textContent = error.message || "Feed Your Yoto could not refresh the image right now.";
+  }
+};
+
+const applyStoryCardArtworkUpdate = (updatedStoryCard) => {
+  if (!updatedStoryCard?.id) return;
+  const index = storyCards.findIndex((storyCard) => storyCard.id === updatedStoryCard.id);
+  if (index >= 0) {
+    storyCards[index] = { ...storyCards[index], ...updatedStoryCard };
+  } else {
+    storyCards.push(updatedStoryCard);
+  }
+
+  renderCards();
+  if (activeCardId === updatedStoryCard.id && !backdrop.hidden) {
+    updateEditorPreview(storyCards.find((storyCard) => storyCard.id === updatedStoryCard.id));
+  }
+  if (podcastImageModalState.storyCardId === updatedStoryCard.id && !podcastImageBackdrop.hidden) {
+    renderPodcastImageModal();
+  }
+};
+
+const refreshStoryCardArtworkFromYoto = async (storyCardId) => {
+  if (!storyCardId) return;
+  try {
+    const result = await apiRequest(
+      `/api/story-cards/${encodeURIComponent(storyCardId)}/artwork/sync`,
+      { method: "POST" }
+    );
+    if (result?.storyCard) applyStoryCardArtworkUpdate(result.storyCard);
+  } catch (error) {
+    console.warn("Could not refresh Story Playlist artwork.", error);
+  }
+};
+
+const applyYotoPlaylistArtworkToStoryCardCache = (cards = []) => {
+  const cardsById = new Map(cards.map((card) => [String(card.id || ""), card]));
+  let changed = false;
+  storyCards = storyCards.map((storyCard) => {
+    const yotoCard = cardsById.get(String(storyCard.yotoPlaylistId || ""));
+    if (!yotoCard?.artworkInspected) return storyCard;
+    const yotoPlaylistImageUrl = yotoCard.imageUrl || null;
+    const podcastImageUrl = getPodcastImageUrlForStoryCard(storyCard);
+    const podcastImageIsConfirmedOnYoto =
+      storyCard.playlistImageSource === "rss_on_yoto" &&
+      Boolean(podcastImageUrl) &&
+      getValidArtworkUrl(storyCard.lastPodcastImageAppliedUrl) === podcastImageUrl;
+    const playlistImageSource = yotoPlaylistImageUrl
+      ? podcastImageIsConfirmedOnYoto ? "rss_on_yoto" : "yoto_custom"
+      : podcastImageUrl
+        ? "rss_fallback"
+        : "placeholder";
+    if (
+      storyCard.yotoPlaylistImageUrl === yotoPlaylistImageUrl &&
+      storyCard.playlistImageSource === playlistImageSource
+    ) {
+      return storyCard;
+    }
+    changed = true;
+    return { ...storyCard, yotoPlaylistImageUrl, playlistImageSource };
+  });
+
+  if (!changed) return;
+  renderCards();
+  const activeCard = getActiveStoryCard();
+  if (activeCard && !backdrop.hidden) updateEditorPreview(activeCard);
+};
+
 const openEditor = (storyCard) => {
   activeCardId = storyCard.id;
   hideDeleteConfirmation();
@@ -3011,6 +3404,7 @@ const openEditor = (storyCard) => {
 
   backdrop.hidden = false;
   setModalLock();
+  refreshStoryCardArtworkFromYoto(storyCard.id);
   loadStoryQueue(storyCard.id, { discoverIfEmpty: true });
   window.setTimeout(() => editorTabs.find((tab) => tab.dataset.editorTab === "stories")?.focus(), 0);
 };
@@ -3086,8 +3480,6 @@ const saveActiveCard = async () => {
     updatePayload.yotoPlaylistTitle = selectedYotoCard
       ? getYotoCardTitle(selectedYotoCard)
       : getStoryCardPlaylistTitle(activeCard);
-    updatePayload.yotoPlaylistImageUrl =
-      selectedYotoCard?.imageUrl || getStoryCardPlaylistImageUrl(activeCard);
 
     if (isPodcastChangeConfirmed()) {
       updatePayload.podcastLink = rssFeed.value.trim();
@@ -3167,6 +3559,7 @@ const loadYotoCardsForSetup = async ({ force = false, showLoading = true } = {})
     if (loadId !== yotoCardsLoadId) return;
 
     availableYotoCards = Array.isArray(cards) ? cards : [];
+    applyYotoPlaylistArtworkToStoryCardCache(availableYotoCards);
     yotoCardsLoadState = {
       status: "loaded",
       message: "",
@@ -3524,10 +3917,6 @@ const saveSetupStoryCard = async () => {
         setupDraft.playlistMode === "existing"
           ? setupDraft.yotoCardTitle || getYotoCardTitle(selectedYotoCard)
           : setupDraft.newPlaylistTitle.trim(),
-      yotoPlaylistImageUrl:
-        setupDraft.playlistMode === "existing"
-          ? setupDraft.yotoCardImageUrl || selectedYotoCard?.imageUrl || null
-          : null,
       automaticChecksEnabled: setupDraft.automaticChecksEnabled,
       updateRhythm: setupDraft.automaticChecksEnabled ? "daily" : "manual",
       lateCheckRhythm: setupDraft.automaticChecksEnabled ? "hourly" : "",
@@ -3853,6 +4242,20 @@ deleteCard.addEventListener("click", showDeleteConfirmation);
 cancelDeleteCard.addEventListener("click", hideDeleteConfirmation);
 confirmDeleteCard.addEventListener("click", deleteActiveCard);
 
+dialogArtworkActions?.addEventListener("click", (event) => {
+  const activeCard = getActiveStoryCard();
+  if (!activeCard) return;
+
+  if (event.target.closest("[data-see-podcast-image]")) {
+    openPodcastImageModal(activeCard);
+    return;
+  }
+
+  if (event.target.closest("[data-refresh-yoto-image]")) {
+    refreshActiveImageFromYoto();
+  }
+});
+
 setupStepContent.addEventListener("click", (event) => {
   const playlistModeOption = event.target.closest("[data-playlist-mode]");
   if (playlistModeOption) {
@@ -3926,6 +4329,37 @@ setupStepContent.addEventListener("change", (event) => {
 
 saveCard.addEventListener("click", saveActiveCard);
 closeDialog.addEventListener("click", closeEditor);
+podcastImageContent?.addEventListener("input", (event) => {
+  const field = event.target?.dataset?.artworkLayout;
+  if (!field || podcastImageModalState.busy) return;
+  podcastImageModalState = {
+    ...podcastImageModalState,
+    layout: normalizePlaylistArtworkLayout({
+      ...podcastImageModalState.layout,
+      [field]: event.target.value,
+    }),
+    message: "",
+    messageType: "",
+  };
+  if (podcastImageMessage) {
+    podcastImageMessage.textContent = "";
+    podcastImageMessage.className = "podcast-image-message";
+  }
+  updatePodcastImageEditorPreview();
+});
+podcastImageContent?.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-reset-artwork-layout]") || podcastImageModalState.busy) return;
+  podcastImageModalState = {
+    ...podcastImageModalState,
+    layout: { ...DEFAULT_PLAYLIST_ARTWORK_LAYOUT },
+    message: "",
+    messageType: "",
+  };
+  renderPodcastImageModal();
+});
+closePodcastImageDialog?.addEventListener("click", closePodcastImageModal);
+cancelPodcastImageDialog?.addEventListener("click", closePodcastImageModal);
+replacePodcastImageButton?.addEventListener("click", replaceYotoImageWithPodcastImage);
 addCardButton.addEventListener("click", () => {
   if (!requireAuth("Connect Yoto to add a story card.")) return;
   openSetupFlow();
@@ -3958,6 +4392,10 @@ backdrop.addEventListener("click", (event) => {
   if (event.target === backdrop) closeEditor();
 });
 
+podcastImageBackdrop?.addEventListener("click", (event) => {
+  if (event.target === podcastImageBackdrop) closePodcastImageModal();
+});
+
 setupBackdrop.addEventListener("click", (event) => {
   if (event.target === setupBackdrop) closeSetupFlow();
 });
@@ -3976,6 +4414,11 @@ window.addEventListener("keydown", (event) => {
 
   if (!setupBackdrop.hidden) {
     closeSetupFlow();
+    return;
+  }
+
+  if (!podcastImageBackdrop.hidden) {
+    closePodcastImageModal();
     return;
   }
 
